@@ -418,7 +418,12 @@ func (a *Agent) generateSectionWithTools(
 	const maxIter = 5
 
 	system := fmt.Sprintf(sectionSystemPrompt, title, focus, scenario)
-	userMsg := fmt.Sprintf("Generate the \"%s\" section of the report.\nFocus: %s\nScenario: %s\n\nStart by calling 1-3 tools to gather evidence, then write the section content.", title, focus, scenario)
+
+	// Pre-fetch graph context using ranked search so the LLM starts with
+	// relevant entities and facts before its first tool call.
+	graphCtx := graph.GraphContext(a.db, projectID, focus, 20)
+
+	userMsg := fmt.Sprintf("%sGenerate the \"%s\" section of the report.\nFocus: %s\nScenario: %s\n\nStart by calling 1-3 tools to gather evidence, then write the section content.", graphCtx, title, focus, scenario)
 
 	messages := []llm.Message{
 		{Role: "system", Content: system},

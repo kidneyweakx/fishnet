@@ -68,8 +68,9 @@ const (
 
 type analyzeStartMsg struct{ dir string }
 type analyzeProgressMsg struct {
-	done, total int64
+	done, total  int64
 	nodes, edges int64
+	merged       int64 // entity resolution: nodes merged
 	err          error
 	final        bool
 }
@@ -88,6 +89,12 @@ type interviewRespMsg struct {
 }
 type logMsg struct{ text string }
 
+// expandAgentsMsg is returned when the expand-agents LLM call completes.
+type expandAgentsMsg struct {
+	added int
+	err   error
+}
+
 // wizardProgressMsg carries incremental wizard stage feedback.
 type wizardProgressMsg struct{ stage string }
 
@@ -105,7 +112,7 @@ func checkProxyCmd(baseURL string) tea.Cmd {
 // llmStatusMsg is sent by checkLLMStatusCmd when the LLM provider status check completes.
 type llmStatusMsg struct {
 	ok  bool
-	msg string // e.g. "claude-code: ready" or "openai: key set" or "codex: binary not found"
+	msg string // e.g. "openai: key set" or "codex: binary not found"
 }
 
 // checkLLMStatusCmd runs a background check appropriate for the configured LLM provider.
@@ -113,11 +120,11 @@ func checkLLMStatusCmd(cfg *config.Config) tea.Cmd {
 	return func() tea.Msg {
 		provider := cfg.LLM.Provider
 		switch provider {
-		case "claude-code":
-			ok := llm.CheckClaudeCode()
-			msg := "claude: not found"
+		case "codex-oauth":
+			ok := llm.CheckCodexOAuth()
+			msg := "codex: not auth"
 			if ok {
-				msg = "claude: ready"
+				msg = "codex: oauth ✓"
 			}
 			return llmStatusMsg{ok: ok, msg: msg}
 		case "codex-cli":
@@ -245,6 +252,18 @@ type App struct {
 
 	// Debug screen
 	debugLines []string
+
+	// Model picker overlay
+	modelPickerActive bool
+	modelPickerIdx    int
+	modelPickerList   []string
+
+	// Provider picker overlay
+	providerPickerActive bool
+	providerPickerIdx    int
+
+	// Expand-agents in-progress
+	expandRunning bool
 }
 
 // ─── Run ─────────────────────────────────────────────────────────────────────
@@ -395,7 +414,11 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.addLog("✗ Analyze error: " + msg.err.Error())
 				m.addLog("✗ LLM error: " + msg.err.Error())
 			} else {
-				m.addLog(fmt.Sprintf("✓ Done: +%d nodes, +%d edges", msg.nodes, msg.edges))
+				logLine := fmt.Sprintf("✓ Done: +%d nodes, +%d edges", msg.nodes, msg.edges)
+				if msg.merged > 0 {
+					logLine += fmt.Sprintf(" (%d duplicates merged)", msg.merged)
+				}
+				m.addLog(logLine)
 				nodes, _ := m.db.GetNodes(m.projectID)
 				edges, _ := m.db.GetEdges(m.projectID)
 				m.graphNodes = nodes
@@ -471,6 +494,11 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case wizardProgressMsg:
 		m.wizardMsg = msg.stage
+		// Chain: immediately try to drain the next message so fast bursts
+		// don't have to wait for the 100ms tick.
+		if drain := m.drainWizardCh(); drain != nil {
+			cmds = append(cmds, drain)
+		}
 
 	case wizardDoneMsg:
 		m.wizardCh = nil // channel is exhausted
@@ -530,6 +558,18 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, tea.Tick(30*time.Second, func(t time.Time) tea.Msg {
 			return checkLLMStatusCmd(cfg)()
 		}))
+
+	case expandAgentsMsg:
+		m.expandRunning = false
+		if msg.err != nil {
+			m.addLog("✗ Expand: " + msg.err.Error())
+		} else {
+			m.addLog(fmt.Sprintf("✓ Expanded: +%d agents added", msg.added))
+			// Refresh graph nodes
+			if nodes, err := m.db.GetNodes(m.projectID); err == nil {
+				m.graphNodes = nodes
+			}
+		}
 	}
 
 	// Update active input.
@@ -574,10 +614,117 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+// providerModels returns a list of model names for the given provider.
+func providerModels(provider string) []string {
+	switch provider {
+	case "codex-oauth":
+		// Only Codex-specific models work with the ChatGPT Codex endpoint.
+		// Standard OpenAI models (gpt-4o, o4-mini, etc.) are rejected with 400.
+		return []string{
+			"gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex", "gpt-5.2",
+		}
+	case "codex", "codex-cli", "openai":
+		return []string{"gpt-4.1", "gpt-4.1-mini", "gpt-4o", "gpt-4o-mini", "o4-mini", "o3"}
+	case "anthropic":
+		return []string{"claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001", "claude-sonnet-4-5"}
+	case "ollama":
+		return []string{"llama3.2", "llama3.1", "mistral", "phi4", "qwen2.5", "gemma2"}
+	default:
+		return []string{"gpt-4o", "claude-sonnet-4-6", "o4-mini", "o3"}
+	}
+}
+
+// knownProviders lists all selectable LLM providers.
+var knownProviders = []string{
+	"codex-oauth", "openai", "anthropic", "ollama", "codex-cli", "clicliproxy",
+}
+
 func (m *App) handleKey(msg tea.KeyMsg) tea.Cmd {
+	// Provider picker intercepts keys while active.
+	if m.providerPickerActive {
+		switch msg.String() {
+		case "esc", "p", "P":
+			m.providerPickerActive = false
+		case "up", "k":
+			if m.providerPickerIdx > 0 {
+				m.providerPickerIdx--
+			}
+		case "down", "j":
+			if m.providerPickerIdx < len(knownProviders)-1 {
+				m.providerPickerIdx++
+			}
+		case "enter":
+			m.cfg.LLM.Provider = knownProviders[m.providerPickerIdx]
+			// Reset model to first sensible default for the new provider
+			models := providerModels(m.cfg.LLM.Provider)
+			if len(models) > 0 {
+				m.cfg.LLM.Model = models[0]
+			}
+			config.Save(m.cfg) //nolint
+			m.addLog("→ Provider: " + m.cfg.LLM.Provider + "  Model: " + m.cfg.LLM.Model)
+			m.providerPickerActive = false
+			return checkLLMStatusCmd(m.cfg)
+		}
+		return nil
+	}
+
+	// Model picker intercepts keys while active.
+	if m.modelPickerActive {
+		switch msg.String() {
+		case "esc", "m", "M":
+			m.modelPickerActive = false
+		case "up", "k":
+			if m.modelPickerIdx > 0 {
+				m.modelPickerIdx--
+			}
+		case "down", "j":
+			if m.modelPickerIdx < len(m.modelPickerList)-1 {
+				m.modelPickerIdx++
+			}
+		case "enter":
+			if m.modelPickerIdx < len(m.modelPickerList) {
+				m.cfg.LLM.Model = m.modelPickerList[m.modelPickerIdx]
+				m.addLog("→ Model: " + m.cfg.LLM.Model)
+			}
+			m.modelPickerActive = false
+		}
+		return nil
+	}
+
 	// Wizard intercepts almost all keys while active.
 	if m.screen == screenWizard {
 		return m.handleWizardKey(msg)
+	}
+
+	// When a text input is focused, bypass all global navigation keys.
+	// Only ctrl+c (quit) and esc (blur) are intercepted; enter falls through
+	// to the screen-specific handler; everything else goes to textinput.Update().
+	if m.screen == screenSim && m.simInput.Focused() && !m.simRunning {
+		switch msg.String() {
+		case "ctrl+c":
+			return tea.Quit
+		case "esc":
+			m.simInput.Blur()
+			return nil
+		case "enter":
+			// fall through to screen-specific handler
+		default:
+			return nil // textinput handles this key in Update()
+		}
+	}
+	if m.screen == screenChat && m.panelFocus == focusRight && m.chatInput.Focused() {
+		switch msg.String() {
+		case "ctrl+c":
+			return tea.Quit
+		case "esc":
+			m.chatInput.Blur()
+			m.panelFocus = focusLeft
+			return nil
+		case "enter":
+			// fall through to screen-specific handler
+		default:
+			return nil // textinput handles this key in Update()
+		}
 	}
 
 	// Help toggle — works everywhere.
@@ -652,6 +799,27 @@ func (m *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		case "5":
 			m.screen = screenChat
 			m.panelFocus = focusLeft
+			return nil
+		case "m":
+			m.modelPickerActive = true
+			m.modelPickerList = providerModels(m.cfg.LLM.Provider)
+			m.modelPickerIdx = 0
+			for i, model := range m.modelPickerList {
+				if model == m.cfg.LLM.Model {
+					m.modelPickerIdx = i
+					break
+				}
+			}
+			return nil
+		case "p", "P":
+			m.providerPickerActive = true
+			m.providerPickerIdx = 0
+			for i, prov := range knownProviders {
+				if prov == m.cfg.LLM.Provider {
+					m.providerPickerIdx = i
+					break
+				}
+			}
 			return nil
 		}
 	}
@@ -729,6 +897,14 @@ func (m *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 				m.screen = screenChat
 				m.panelFocus = focusRight
 				m.chatInput.Focus()
+			}
+		case "x", "X":
+			// Expand: generate related agent personas from the selected entity
+			nodes := m.filteredNodes()
+			if !m.expandRunning && m.entityIdx < len(nodes) {
+				m.expandRunning = true
+				m.addLog("→ Expanding agents from: " + nodes[m.entityIdx].Name + "…")
+				return m.doExpandAgents(nodes[m.entityIdx])
 			}
 		case "tab", "l", "right":
 			m.panelFocus = focusRight
@@ -930,9 +1106,97 @@ func (m *App) filteredNodes() []db.Node {
 
 // ─── View ─────────────────────────────────────────────────────────────────────
 
+func (m App) viewModelPicker() string {
+	var lines []string
+	lines = append(lines, S.Bold.Render("  Select Model"))
+	lines = append(lines, S.Dim.Render("  [↑↓] navigate  [enter] confirm  [esc] cancel"))
+	lines = append(lines, "")
+	for i, model := range m.modelPickerList {
+		current := ""
+		if model == m.cfg.LLM.Model {
+			current = S.Green.Render(" ✓")
+		}
+		if i == m.modelPickerIdx {
+			lines = append(lines, selectedStyle.Render("  "+model)+current)
+		} else {
+			lines = append(lines, "  "+model+current)
+		}
+	}
+	content := strings.Join(lines, "\n")
+	w := 42
+	padL := (m.width - w) / 2
+	if padL < 2 {
+		padL = 2
+	}
+	padT := (m.height - len(lines) - 4) / 2
+	if padT < 2 {
+		padT = 2
+	}
+	box := boxStyleBlue.Width(w).Render(content)
+	var out []string
+	for i := 0; i < padT; i++ {
+		out = append(out, "")
+	}
+	out = append(out, strings.Repeat(" ", padL)+box)
+	return strings.Join(out, "\n")
+}
+
+func (m App) viewProviderPicker() string {
+	provDesc := map[string]string{
+		"codex-oauth": "ChatGPT Pro / Codex OAuth (no API key needed)",
+		"openai":      "OpenAI API (requires OPENAI_API_KEY)",
+		"anthropic":   "Anthropic API (requires ANTHROPIC_API_KEY)",
+		"ollama":      "Local Ollama (no key needed)",
+		"codex-cli":   "Local codex binary",
+		"clicliproxy": "CLIProxy / custom OpenAI-compat endpoint",
+	}
+	var lines []string
+	lines = append(lines, S.Bold.Render("  Select Provider  [p]"))
+	lines = append(lines, S.Dim.Render("  [↑↓] navigate  [enter] confirm  [esc] cancel"))
+	lines = append(lines, "")
+	for i, prov := range knownProviders {
+		desc := provDesc[prov]
+		current := ""
+		if prov == m.cfg.LLM.Provider {
+			current = S.Green.Render(" ✓")
+		}
+		label := fmt.Sprintf("  %-14s  %s", prov, S.Dim.Render(desc))
+		if i == m.providerPickerIdx {
+			lines = append(lines, selectedStyle.Render("  "+prov+"  "+desc)+current)
+		} else {
+			lines = append(lines, label+current)
+		}
+	}
+	content := strings.Join(lines, "\n")
+	w := 60
+	padL := (m.width - w) / 2
+	if padL < 2 {
+		padL = 2
+	}
+	padT := (m.height - len(lines) - 4) / 2
+	if padT < 2 {
+		padT = 2
+	}
+	box := boxStyleBlue.Width(w).Render(content)
+	var out []string
+	for i := 0; i < padT; i++ {
+		out = append(out, "")
+	}
+	out = append(out, strings.Repeat(" ", padL)+box)
+	return strings.Join(out, "\n")
+}
+
 func (m App) View() string {
 	if m.width == 0 {
 		return "Initializing…"
+	}
+
+	if m.providerPickerActive {
+		return m.viewProviderPicker()
+	}
+
+	if m.modelPickerActive {
+		return m.viewModelPicker()
 	}
 
 	if m.screen == screenWizard {
@@ -981,7 +1245,7 @@ func (m App) View() string {
 func (m App) renderHeader() string {
 	w := m.width
 	project := S.Blue.Render(m.cfg.Project)
-	model := S.Dim.Render(m.cfg.LLM.Provider + "/" + m.cfg.LLM.Model)
+	model := S.Dim.Render(m.cfg.LLM.Provider + "/" + m.cfg.LLM.Model + " [m][p]")
 
 	// Simulation running indicator
 	simIndicator := ""
@@ -1343,11 +1607,15 @@ func (m App) viewEntities() string {
 
 	// ── Left panel: agent list ──────────────────────────────────────────────
 	panelH := m.height - 8
-	start := m.entityIdx - (panelH / 2)
+	listH := panelH - 5 // reserve lines for hintLine + title inside panel
+	if listH < 3 {
+		listH = 3
+	}
+	start := m.entityIdx - (listH / 2)
 	if start < 0 {
 		start = 0
 	}
-	end := start + panelH
+	end := start + listH
 	if end > len(nodes) {
 		end = len(nodes)
 	}
@@ -1370,9 +1638,13 @@ func (m App) viewEntities() string {
 		}
 	}
 
+	expandHint := "[x] expand"
+	if m.expandRunning {
+		expandHint = "expanding…"
+	}
 	hintLine := "\n" + S.Dim.Render("  [↑↓] navigate") + "\n" +
 		S.Dim.Render("  [5/enter] interview") + "\n" +
-		S.Dim.Render("  [/] search")
+		S.Dim.Render("  [/] search  "+expandHint)
 
 	leftContent := strings.Join(listLines, "\n") + hintLine
 	leftTitle := "Agents"
@@ -1683,8 +1955,10 @@ func (m App) viewSimRunning() string {
 	renderFeedEntry := func(a platform.Action, handlePrefix string, nameStyle lipgloss.Style) string {
 		handle := nameStyle.Render(handlePrefix + clip(platform.SafeUsername(a.AgentName), 12))
 		icon := actionIcon(a.Type)
-		excerpt := ""
-		if a.Content != "" {
+		var excerpt string
+		if !a.Success {
+			excerpt = S.Red.Render("✗ failed")
+		} else if a.Content != "" {
 			excerpt = S.Muted.Render(`"` + clip(a.Content, contentW) + `"`)
 		} else {
 			excerpt = S.Dim.Render(a.Type)
@@ -2401,7 +2675,8 @@ func (m *App) runWizard() tea.Cmd {
 	cfg.LLM.APIKey = apiKey
 
 	// Create a buffered channel for incremental progress messages.
-	ch := make(chan tea.Msg, 16)
+	// 64-slot buffer: progress callbacks fire frequently; drain is 100ms/tick.
+	ch := make(chan tea.Msg, 64)
 	m.wizardCh = ch
 
 	go func() {
@@ -2444,13 +2719,71 @@ func (m *App) runWizard() tea.Cmd {
 		}
 
 		if len(unproc) > 0 {
-			ch <- wizardProgressMsg{stage: fmt.Sprintf("Building knowledge graph (%d chunks)…", len(unproc))}
+			total := len(unproc)
+			ch <- wizardProgressMsg{stage: fmt.Sprintf("Building knowledge graph (%d chunks, concurrency=%d)…", total, cfg.LLM.MaxConcurrency)}
 			client := llm.New(cfg.LLM)
-			builder := graph.NewBuilder(database, client)
-			_, err = builder.BuildFromChunks(ctx, projectID, unproc, cfg.LLM.MaxConcurrency, nil)
+			builder := graph.NewBuilderWithConfig(database, client, graph.Config{
+				ExtractionMode: cfg.Graph.ExtractionMode,
+				BatchSize:      cfg.Graph.BatchSize,
+			})
+			var lastSentDone int64
+			progressCb := func(p graph.Progress) {
+				// Send every 5 chunks or on final chunk to avoid flooding the channel.
+				if p.Done-lastSentDone < 5 && p.Done < int64(total) {
+					return
+				}
+				lastSentDone = p.Done
+				msg := fmt.Sprintf("Building graph: %d/%d chunks (+%d nodes, +%d edges",
+					p.Done, total, p.NodesAdded, p.EdgesAdded)
+				if p.Errors > 0 {
+					msg += fmt.Sprintf(", %d errors", p.Errors)
+				}
+				msg += ")"
+				// Non-blocking: drop if channel buffer is full to never stall LLM goroutines.
+				select {
+				case ch <- wizardProgressMsg{stage: msg}:
+				default:
+				}
+				// Surface error spikes immediately to the log channel.
+				if p.Errors > 0 && p.Done == lastSentDone {
+					select {
+					case ch <- logMsg{fmt.Sprintf("⚠ graph build: %d/%d chunks failed (LLM errors)", p.Errors, total)}:
+					default:
+					}
+				}
+			}
+			var buildProg graph.Progress
+			buildProg, err = builder.BuildFromChunks(ctx, projectID, unproc, cfg.LLM.MaxConcurrency, progressCb)
 			if err != nil {
 				ch <- wizardDoneMsg{projectID: projectID, err: fmt.Errorf("graph build: %w", err)}
 				return
+			}
+			if buildProg.Errors > 0 {
+				select {
+				case ch <- logMsg{fmt.Sprintf("⚠ graph build finished: %d/%d chunks had LLM errors (graph may be incomplete)", buildProg.Errors, total)}:
+				default:
+				}
+			}
+		}
+
+		// Entity resolution + PageRank after graph is built.
+		ch <- wizardProgressMsg{stage: "Resolving duplicate entities…"}
+		resolver := graph.NewResolver()
+		merged, _ := graph.ResolveProjectEntities(database, projectID, resolver)
+		if merged > 0 {
+			select {
+			case ch <- logMsg{fmt.Sprintf("✓ Entity resolution: merged %d duplicates", merged)}:
+			default:
+			}
+		}
+
+		ch <- wizardProgressMsg{stage: "Computing PageRank…"}
+		if allNodes, e2 := database.GetNodes(projectID); e2 == nil {
+			if allEdges, e2 := database.GetEdges(projectID); e2 == nil {
+				ranks := graph.ComputePageRank(allNodes, allEdges)
+				for nodeID, score := range ranks {
+					_ = database.UpdatePageRank(nodeID, score)
+				}
 			}
 		}
 
@@ -2715,7 +3048,10 @@ func (m *App) startAnalyze() tea.Cmd {
 		cfg.LLM.APIKey = apiKey
 
 		client := llm.New(cfg.LLM)
-		builder := graph.NewBuilder(database, client)
+		builder := graph.NewBuilderWithConfig(database, client, graph.Config{
+			ExtractionMode: cfg.Graph.ExtractionMode,
+			BatchSize:      cfg.Graph.BatchSize,
+		})
 
 		prog, err := builder.BuildFromChunks(
 			ctx, projectID, chunks, cfg.LLM.MaxConcurrency,
@@ -2725,10 +3061,26 @@ func (m *App) startAnalyze() tea.Cmd {
 		if err != nil {
 			return analyzeProgressMsg{err: err, final: true}
 		}
+
+		// Entity resolution: merge duplicate/near-duplicate nodes.
+		resolver := graph.NewResolver()
+		merged, _ := graph.ResolveProjectEntities(database, projectID, resolver)
+
+		// PageRank: compute and persist scores for future ranked search.
+		if allNodes, err2 := database.GetNodes(projectID); err2 == nil {
+			if allEdges, err2 := database.GetEdges(projectID); err2 == nil {
+				ranks := graph.ComputePageRank(allNodes, allEdges)
+				for nodeID, score := range ranks {
+					_ = database.UpdatePageRank(nodeID, score)
+				}
+			}
+		}
+
 		return analyzeProgressMsg{
 			done: prog.Done, total: int64(prog.Total),
 			nodes: prog.NodesAdded, edges: prog.EdgesAdded,
-			final: true,
+			merged: int64(merged),
+			final:  true,
 		}
 	}
 }
@@ -2920,6 +3272,68 @@ func (m *App) saveReport() {
 	}
 	if err := os.WriteFile("report.md", []byte(m.reportContent), 0644); err == nil {
 		m.addLog("✓ Saved report.md")
+	}
+}
+
+// doExpandAgents uses the LLM to generate 3-5 related agent personas from the selected node,
+// then upserts them into the graph. The user can press [x] in the Entities view to trigger this.
+func (m *App) doExpandAgents(seed db.Node) tea.Cmd {
+	cfg := m.cfg
+	database := m.db
+	projectID := m.projectID
+
+	apiKey := cfg.LLM.APIKey
+	if apiKey == "" {
+		apiKey = os.Getenv("OPENAI_API_KEY")
+		if apiKey == "" {
+			apiKey = os.Getenv("ANTHROPIC_API_KEY")
+		}
+	}
+	cfg.LLM.APIKey = apiKey
+
+	// Gather graph context for the seed node.
+	graphCtx := graph.GraphContext(database, projectID, seed.Name, 10)
+
+	const expandSystem = `You are a social simulation expert. Given a seed entity from a knowledge graph, generate 3 to 5 related agent personas that are realistically connected to it. Each persona should have a distinct role, perspective, or relationship to the seed.
+Return ONLY a JSON array of objects (no markdown, no explanation):
+[
+  {
+    "name": "Persona Name",
+    "type": "Person",
+    "summary": "one-line description (under 20 words)",
+    "attributes": {"stance": "neutral|supportive|opposing", "profession": "...", "relation": "how they relate to seed"}
+  }
+]
+Types can be: Person, Company, Organization, Community, Role.`
+
+	return func() tea.Msg {
+		client := llm.New(cfg.LLM)
+
+		userMsg := fmt.Sprintf("Seed entity: %s (%s)\nSummary: %s\n\nGraph context:\n%s\n\nGenerate 3-5 related agent personas.",
+			seed.Name, seed.Type, seed.Summary, graphCtx)
+
+		type personaJSON struct {
+			Name       string            `json:"name"`
+			Type       string            `json:"type"`
+			Summary    string            `json:"summary"`
+			Attributes map[string]string `json:"attributes"`
+		}
+		var personas []personaJSON
+		if err := client.JSON(context.Background(), expandSystem, userMsg, &personas); err != nil {
+			return expandAgentsMsg{err: err}
+		}
+
+		added := 0
+		for _, p := range personas {
+			if p.Name == "" || p.Type == "" {
+				continue
+			}
+			attrs, _ := json.Marshal(p.Attributes)
+			if _, err := database.UpsertNode(projectID, p.Name, p.Type, p.Summary, string(attrs)); err == nil {
+				added++
+			}
+		}
+		return expandAgentsMsg{added: added}
 	}
 }
 

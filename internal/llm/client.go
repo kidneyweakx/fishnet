@@ -205,8 +205,8 @@ func (c *Client) doChat(ctx context.Context, msgs []Message) (string, error) {
 	case "clicliproxy":
 		// CLIProxyAPI exposes an OpenAI-compatible endpoint; route through the same handler.
 		return c.doOpenAI(ctx, msgs)
-	case "claude-code":
-		return c.doClaudeCode(ctx, msgs)
+	case "codex-oauth":
+		return c.doCodexOAuth(ctx, msgs)
 	default:
 		return c.doOpenAI(ctx, msgs)
 	}
@@ -343,19 +343,6 @@ func CheckProxy(baseURL string) bool {
 	return resp.StatusCode == http.StatusOK
 }
 
-// CheckClaudeCode checks if the local claude CLI binary is available and functional.
-func CheckClaudeCode() bool {
-	bin, err := exec.LookPath("claude")
-	if err != nil {
-		return false
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, bin, "--version")
-	out, err := cmd.Output()
-	return err == nil && len(out) > 0
-}
-
 // CheckCodexCLI checks if the local codex CLI binary is available and functional.
 func CheckCodexCLI() bool {
 	bin, err := exec.LookPath("codex")
@@ -383,68 +370,6 @@ func CheckAPIKey(provider, apiKey string) bool {
 		return true // no key needed
 	}
 	return false
-}
-
-// doClaudeCode runs the local `claude` CLI binary and parses its JSON output.
-func (c *Client) doClaudeCode(ctx context.Context, msgs []Message) (string, error) {
-	bin, err := exec.LookPath("claude")
-	if err != nil {
-		if c.cfg.CodexBin != "" {
-			bin = c.cfg.CodexBin
-		} else {
-			return "", fmt.Errorf("claude binary not found in PATH")
-		}
-	}
-
-	// Build single prompt from message history
-	var systemPrompt string
-	var parts []string
-	for _, m := range msgs {
-		switch m.Role {
-		case "system":
-			systemPrompt = m.Content
-		case "user":
-			parts = append(parts, m.Content)
-		case "assistant":
-			parts = append(parts, "[Context: "+m.Content+"]")
-		}
-	}
-	prompt := strings.Join(parts, "\n\n")
-	if prompt == "" {
-		return "", fmt.Errorf("empty prompt")
-	}
-
-	args := []string{"-p", prompt, "--output-format", "json"}
-	if systemPrompt != "" {
-		args = append(args, "--append-system-prompt", systemPrompt)
-	}
-
-	cmd := exec.CommandContext(ctx, bin, args...)
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("claude cli: %w", err)
-	}
-
-	var resp struct {
-		Type    string `json:"type"`
-		IsError bool   `json:"is_error"`
-		Result  string `json:"result"`
-	}
-	if jsonErr := json.Unmarshal(out, &resp); jsonErr != nil {
-		// try plain text fallback
-		s := strings.TrimSpace(string(out))
-		if s != "" {
-			return s, nil
-		}
-		return "", fmt.Errorf("claude cli parse: %w", jsonErr)
-	}
-	if resp.IsError {
-		return "", fmt.Errorf("claude cli error: %s", resp.Result)
-	}
-	if resp.Result == "" {
-		return "", fmt.Errorf("claude cli empty response")
-	}
-	return resp.Result, nil
 }
 
 func (c *Client) doAnthropic(ctx context.Context, msgs []Message) (string, error) {

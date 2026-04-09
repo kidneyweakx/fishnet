@@ -149,6 +149,8 @@ func Open(path string) (*DB, error) {
 	if _, err := raw.Exec(schema); err != nil {
 		return nil, fmt.Errorf("init schema: %w", err)
 	}
+	// Run additive migrations (idempotent — errors mean column already exists).
+	MigrateSchema(raw)
 	return &DB{raw}, nil
 }
 
@@ -250,6 +252,7 @@ type Node struct {
 	Summary     string
 	Attributes  string // JSON
 	CommunityID int
+	PageRank    float64
 	CreatedAt   time.Time
 }
 
@@ -279,7 +282,8 @@ func (db *DB) UpsertNode(projectID, name, nodeType, summary, attrs string) (stri
 
 func (db *DB) GetNodes(projectID string) ([]Node, error) {
 	rows, err := db.Query(`
-		SELECT id, project_id, name, type, COALESCE(summary,''), COALESCE(attributes,'{}'), community_id
+		SELECT id, project_id, name, type, COALESCE(summary,''), COALESCE(attributes,'{}'),
+		       community_id, COALESCE(pagerank, 0.0)
 		FROM nodes WHERE project_id = ?`, projectID)
 	if err != nil {
 		return nil, err
@@ -288,7 +292,7 @@ func (db *DB) GetNodes(projectID string) ([]Node, error) {
 	var out []Node
 	for rows.Next() {
 		var n Node
-		rows.Scan(&n.ID, &n.ProjectID, &n.Name, &n.Type, &n.Summary, &n.Attributes, &n.CommunityID)
+		rows.Scan(&n.ID, &n.ProjectID, &n.Name, &n.Type, &n.Summary, &n.Attributes, &n.CommunityID, &n.PageRank)
 		out = append(out, n)
 	}
 	return out, rows.Err()

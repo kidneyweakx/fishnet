@@ -3,6 +3,7 @@ package graph
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 
 	"fishnet/internal/db"
@@ -17,8 +18,8 @@ type SearchResult struct {
 	Query string
 }
 
-// QuickSearch performs a keyword search on node names, types, and summaries,
-// plus edge fact fields, using case-insensitive substring matching.
+// QuickSearch performs a TF-IDF scored search on node names, types, and summaries,
+// plus edge fact fields. Results are ranked by (tfidf*0.6 + subBonus*0.3 + pagerank*0.1).
 func QuickSearch(database *db.DB, projectID, query string, limit int) SearchResult {
 	result := SearchResult{Query: query}
 
@@ -42,20 +43,63 @@ func QuickSearch(database *db.DB, projectID, query string, limit int) SearchResu
 		nodeByID[n.ID] = n
 	}
 
-	// Match nodes where ANY keyword appears in name, type, or summary
-	nodeSet := make(map[string]db.Node)
+	// Build TF-IDF scorer
+	scorer := BuildTFIDF(allNodes)
+
+	// Score each node: TF-IDF × 0.6 + substring bonus × 0.3 + PageRank × 0.1
+	// PageRank is read from n.PageRank (persisted to DB after each analyze/init).
+	// Fall back to in-memory computation only when all pageranks are zero (first run).
+	hasStoredPR := false
 	for _, n := range allNodes {
-		if matchesAny(keywords, n.Name, n.Type, n.Summary) {
-			nodeSet[n.ID] = n
+		if n.PageRank > 0 {
+			hasStoredPR = true
+			break
 		}
+	}
+	var livePR map[string]float64
+	if !hasStoredPR {
+		livePR = ComputePageRank(allNodes, allEdges)
+	}
+
+	type scoredNode struct {
+		node  db.Node
+		score float64
+	}
+	var scored []scoredNode
+
+	for _, n := range allNodes {
+		tfidf := scorer(n.ID, query)
+		subMatch := matchesAny(keywords, n.Name, n.Type, n.Summary)
+		if tfidf <= 0 && !subMatch {
+			continue
+		}
+		subBonus := 0.0
+		if subMatch {
+			subBonus = 0.3
+		}
+		pr := n.PageRank
+		if !hasStoredPR {
+			pr = livePR[n.ID]
+		}
+		score := tfidf*0.6 + subBonus*0.3 + pr*0.1
+		scored = append(scored, scoredNode{n, score})
+	}
+
+	// Sort by score DESC
+	sort.Slice(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
+
+	// Build node set for edge lookup (all scored nodes, not limited yet)
+	nodeSet := make(map[string]db.Node, len(scored))
+	for _, sn := range scored {
+		nodeSet[sn.node.ID] = sn.node
 	}
 
 	// Collect matched nodes (up to limit)
-	for _, n := range nodeSet {
+	for _, sn := range scored {
 		if limit > 0 && len(result.Nodes) >= limit {
 			break
 		}
-		result.Nodes = append(result.Nodes, n)
+		result.Nodes = append(result.Nodes, sn.node)
 	}
 
 	// Collect edges where both endpoints are matched nodes or edge fact matches
@@ -64,7 +108,7 @@ func QuickSearch(database *db.DB, projectID, query string, limit int) SearchResu
 		_, srcMatched := nodeSet[e.SourceID]
 		_, tgtMatched := nodeSet[e.TargetID]
 		factMatched := matchesAny(keywords, e.Fact, e.Type)
-		if (srcMatched || tgtMatched) || factMatched {
+		if srcMatched || tgtMatched || factMatched {
 			edgeSet[e.ID] = e
 		}
 	}
@@ -83,8 +127,9 @@ func QuickSearch(database *db.DB, projectID, query string, limit int) SearchResu
 	return result
 }
 
-// PanoramaSearch performs a broad search returning all nodes matching any keyword,
-// plus all their connected edges and the nodes at those edge endpoints.
+// PanoramaSearch performs a broad search using TF-IDF to find seed nodes, then
+// expands via BFS multi-hop traversal. Results are ranked by BFS closeness score
+// boosted by PageRank.
 func PanoramaSearch(database *db.DB, projectID, query string, limit int) SearchResult {
 	result := SearchResult{Query: query}
 
@@ -108,43 +153,67 @@ func PanoramaSearch(database *db.DB, projectID, query string, limit int) SearchR
 		nodeByID[n.ID] = n
 	}
 
-	// Match nodes
-	seedSet := make(map[string]db.Node)
+	// Build TF-IDF scorer and compute PageRank
+	scorer := BuildTFIDF(allNodes)
+	pageranks := ComputePageRank(allNodes, allEdges)
+
+	// Find seed nodes via TF-IDF + substring match
+	var seedIDs []string
+	seedSet := make(map[string]bool)
 	for _, n := range allNodes {
-		if matchesAny(keywords, n.Name, n.Type, n.Summary) {
-			seedSet[n.ID] = n
-		}
-	}
-
-	// Find all edges touching matched nodes, collect neighbor nodes too
-	finalNodes := make(map[string]db.Node)
-	finalEdges := make(map[string]db.Edge)
-
-	for id, n := range seedSet {
-		finalNodes[id] = n
-	}
-
-	for _, e := range allEdges {
-		_, srcSeed := seedSet[e.SourceID]
-		_, tgtSeed := seedSet[e.TargetID]
-		if srcSeed || tgtSeed {
-			finalEdges[e.ID] = e
-			// Pull in neighbor nodes
-			if n, ok := nodeByID[e.SourceID]; ok {
-				finalNodes[n.ID] = n
-			}
-			if n, ok := nodeByID[e.TargetID]; ok {
-				finalNodes[n.ID] = n
+		tfidf := scorer(n.ID, query)
+		subMatch := matchesAny(keywords, n.Name, n.Type, n.Summary)
+		if tfidf > 0 || subMatch {
+			if !seedSet[n.ID] {
+				seedSet[n.ID] = true
+				seedIDs = append(seedIDs, n.ID)
 			}
 		}
 	}
 
-	// Populate result (respecting limit for nodes)
-	for _, n := range finalNodes {
+	// BFS expansion from seed nodes (maxHops=2)
+	bfsWeights := BFSNeighborhood(seedIDs, allEdges, 2)
+
+	// Score all nodes that BFS touched
+	type scoredNode struct {
+		node  db.Node
+		score float64
+	}
+	var scored []scoredNode
+	for _, n := range allNodes {
+		bfsW, inBFS := bfsWeights[n.ID]
+		if !inBFS {
+			continue
+		}
+		// TODO: use DB pagerank once schema upgraded
+		pr := pageranks[n.ID]
+		score := bfsW*0.7 + pr*0.3
+		scored = append(scored, scoredNode{n, score})
+	}
+
+	// Sort by score DESC
+	sort.Slice(scored, func(i, j int) bool { return scored[i].score > scored[j].score })
+
+	// Collect all BFS-touched nodes (used for edge collection before limit)
+	allScoredIDs := make(map[string]bool, len(scored))
+	for _, sn := range scored {
+		allScoredIDs[sn.node.ID] = true
+	}
+
+	// Populate result respecting limit for nodes
+	for _, sn := range scored {
 		if limit > 0 && len(result.Nodes) >= limit {
 			break
 		}
-		result.Nodes = append(result.Nodes, n)
+		result.Nodes = append(result.Nodes, sn.node)
+	}
+
+	// Collect edges between any BFS-touched nodes
+	finalEdges := make(map[string]db.Edge)
+	for _, e := range allEdges {
+		if allScoredIDs[e.SourceID] || allScoredIDs[e.TargetID] {
+			finalEdges[e.ID] = e
+		}
 	}
 
 	for _, e := range finalEdges {
@@ -159,6 +228,45 @@ func PanoramaSearch(database *db.DB, projectID, query string, limit int) SearchR
 	}
 
 	return result
+}
+
+// GraphContext builds a formatted context string for use in LLM prompts.
+// It's the ZEP-equivalent of get_simulation_context() for report generation.
+// Returns top facts, entity summaries, and community context.
+func GraphContext(database *db.DB, projectID, query string, maxFacts int) string {
+	if maxFacts <= 0 {
+		maxFacts = 20
+	}
+
+	result := PanoramaSearch(database, projectID, query, 30)
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("## Graph Context for: %s\n\n", query))
+
+	if len(result.Nodes) > 0 {
+		sb.WriteString(fmt.Sprintf("### Key Entities (%d found)\n", len(result.Nodes)))
+		for i, n := range result.Nodes {
+			if i >= 10 {
+				break
+			}
+			sb.WriteString(fmt.Sprintf("- **%s** (%s): %s\n", n.Name, n.Type, n.Summary))
+		}
+		sb.WriteString("\n")
+	}
+
+	if len(result.Facts) > 0 {
+		sb.WriteString(fmt.Sprintf("### Key Facts (%d found)\n", len(result.Facts)))
+		for i, f := range result.Facts {
+			if i >= maxFacts {
+				sb.WriteString(fmt.Sprintf("... and %d more facts\n", len(result.Facts)-maxFacts))
+				break
+			}
+			sb.WriteString(fmt.Sprintf("- %s\n", f))
+		}
+		sb.WriteString("\n")
+	}
+
+	return sb.String()
 }
 
 // InsightForge uses an LLM to decompose the query into 3-5 sub-questions,

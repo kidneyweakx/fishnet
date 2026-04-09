@@ -8,7 +8,7 @@ import (
 )
 
 type LLMConfig struct {
-	Provider       string  `json:"provider"`        // openai | anthropic | ollama | codex | codex-cli | clicliproxy | claude-code | custom
+	Provider       string  `json:"provider"`        // openai | anthropic | ollama | codex | codex-cli | codex-oauth | clicliproxy | custom
 	Model          string  `json:"model"`
 	APIKey         string  `json:"api_key"`
 	BaseURL        string  `json:"base_url"`
@@ -21,9 +21,11 @@ type LLMConfig struct {
 }
 
 type GraphConfig struct {
-	ChunkSize        int `json:"chunk_size"`
-	ChunkOverlap     int `json:"chunk_overlap"`
-	CommunityMinSize int `json:"community_min_size"`
+	ChunkSize        int    `json:"chunk_size"`
+	ChunkOverlap     int    `json:"chunk_overlap"`
+	CommunityMinSize int    `json:"community_min_size"`
+	ExtractionMode   string `json:"extraction_mode"` // "local" | "llm" | "hybrid"
+	BatchSize        int    `json:"batch_size"`       // chunks per LLM call (default 3)
 }
 
 type SimConfig struct {
@@ -57,6 +59,8 @@ func Default() *Config {
 			ChunkSize:        600,
 			ChunkOverlap:     80,
 			CommunityMinSize: 2,
+			ExtractionMode:   "local",
+			BatchSize:        3,
 		},
 		Sim: SimConfig{
 			DefaultRounds: 3,
@@ -113,8 +117,8 @@ func ProviderBaseURL(provider string) string {
 		return "https://api.openai.com/v1" // same endpoint, different model (e.g. o4-mini)
 	case "clicliproxy":
 		return "http://localhost:8080/v1"
-	case "claude-code":
-		return "" // uses local claude binary, no base URL
+	case "codex-oauth":
+		return "" // uses Codex Responses API with OAuth tokens, no OpenAI-compat base URL
 	default:
 		return "https://api.openai.com/v1"
 	}

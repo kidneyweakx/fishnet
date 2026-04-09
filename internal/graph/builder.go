@@ -56,7 +56,9 @@ Rules:
 
 // Config holds optional configuration for the Builder.
 type Config struct {
-	Schema *OntologySchema // optional; if set, guides entity extraction
+	Schema         *OntologySchema // optional; if set, guides entity extraction
+	BatchSize      int             // chunks per LLM call (default 3; reduces API calls ~3x)
+	ExtractionMode string          // "local" | "llm" | "hybrid" (default: "local")
 }
 
 type Builder struct {
@@ -83,6 +85,8 @@ type Progress struct {
 }
 
 // BuildFromChunks processes chunks concurrently, extracting entities into the graph.
+// Chunks are grouped into batches (config.BatchSize, default 3) so each LLM call
+// covers multiple chunks, reducing total API round-trips ~3x.
 func (b *Builder) BuildFromChunks(
 	ctx context.Context,
 	projectID string,
@@ -96,31 +100,60 @@ func (b *Builder) BuildFromChunks(
 	if concurrency <= 0 {
 		concurrency = 4
 	}
+	batchSize := b.config.BatchSize
+	if batchSize <= 0 {
+		batchSize = 3
+	}
+
+	// Group chunks into batches.
+	type batch struct{ chunks []db.Chunk }
+	var batches []batch
+	for i := 0; i < len(chunks); i += batchSize {
+		end := i + batchSize
+		if end > len(chunks) {
+			end = len(chunks)
+		}
+		batches = append(batches, batch{chunks: chunks[i:end]})
+	}
+
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
 
-	for _, chunk := range chunks {
+	for _, bt := range batches {
 		select {
 		case <-ctx.Done():
 			return p, ctx.Err()
 		case sem <- struct{}{}:
 		}
 		wg.Add(1)
-		go func(c db.Chunk) {
+		go func(bt batch) {
 			defer func() {
 				<-sem
 				wg.Done()
 			}()
 
-			extracted, err := b.extractFromChunk(ctx, c.Content)
-			if err != nil {
-				atomic.AddInt64(&p.Errors, 1)
-				atomic.AddInt64(&p.Done, 1)
-				if onProgress != nil {
-					onProgress(p)
+			texts := make([]string, len(bt.chunks))
+			for i, c := range bt.chunks {
+				texts[i] = c.Content
+			}
+			var extracted *extractionResult
+			var err error
+			if b.config.ExtractionMode == "llm" {
+				extracted, err = b.extractFromChunks(ctx, texts)
+				if err != nil {
+					atomic.AddInt64(&p.Errors, int64(len(bt.chunks)))
+					atomic.AddInt64(&p.Done, int64(len(bt.chunks)))
+					if onProgress != nil {
+						onProgress(p)
+					}
+					return
 				}
-				return
+			} else {
+				// "local" / "hybrid" / "" — prose NER.
+				// Auto-translate CJK-heavy chunks to English first so prose NER works.
+				localEx := NewLocalExtractor()
+				extracted = localEx.Extract(translateCJKBatch(ctx, b.llm, texts))
 			}
 
 			mu.Lock()
@@ -129,30 +162,44 @@ func (b *Builder) BuildFromChunks(
 
 			atomic.AddInt64(&p.NodesAdded, int64(nodes))
 			atomic.AddInt64(&p.EdgesAdded, int64(edges))
-			atomic.AddInt64(&p.Done, 1)
+			atomic.AddInt64(&p.Done, int64(len(bt.chunks)))
 
-			_ = b.db.MarkChunkDone(c.ID)
+			for _, c := range bt.chunks {
+				_ = b.db.MarkChunkDone(c.ID)
+			}
 			if onProgress != nil {
 				onProgress(p)
 			}
-		}(chunk)
+		}(bt)
 	}
 
 	wg.Wait()
 	return p, nil
 }
 
-// extractFromChunk calls the LLM to extract entities/relationships from a text
-// chunk. It retries up to maxJSONRetries times on JSON parse failure, since
-// LLMs occasionally return malformed JSON.
+// extractFromChunks calls the LLM to extract entities/relationships from one or
+// more text chunks in a single API call. Sending multiple chunks at once
+// (~3 by default) reduces total round-trips ~3x with no quality loss.
+// It retries up to maxJSONRetries times on JSON parse failure.
 const maxJSONRetries = 3
 
-func (b *Builder) extractFromChunk(ctx context.Context, text string) (*extractionResult, error) {
+func (b *Builder) extractFromChunks(ctx context.Context, texts []string) (*extractionResult, error) {
 	prompt := systemPrompt
 	if b.config.Schema != nil {
 		prompt += b.config.Schema.ToPromptHint()
 	}
-	userMsg := fmt.Sprintf("Extract entities and relationships from this text:\n\n%s", text)
+
+	var userMsg string
+	if len(texts) == 1 {
+		userMsg = fmt.Sprintf("Extract entities and relationships from this text:\n\n%s", texts[0])
+	} else {
+		var sb strings.Builder
+		sb.WriteString("Extract entities and relationships from ALL of the following text sections. Merge entities that refer to the same real-world actor.\n\n")
+		for i, t := range texts {
+			sb.WriteString(fmt.Sprintf("=== SECTION %d ===\n%s\n\n", i+1, t))
+		}
+		userMsg = sb.String()
+	}
 
 	var result extractionResult
 	var lastErr error
@@ -161,11 +208,9 @@ func (b *Builder) extractFromChunk(ctx context.Context, text string) (*extractio
 		if lastErr == nil {
 			return &result, nil
 		}
-		// Only retry on JSON parse errors, not on context cancellation or API errors.
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		// Reset result for next attempt
 		result = extractionResult{}
 	}
 	return nil, fmt.Errorf("extraction failed after %d attempts: %w", maxJSONRetries, lastErr)
@@ -209,4 +254,65 @@ func (b *Builder) storeExtraction(projectID string, ex *extractionResult) (nodes
 		}
 	}
 	return
+}
+
+// ─── CJK Translation ─────────────────────────────────────────────────────────
+
+// isCJKHeavy returns true when more than 15% of runes in the text are
+// CJK Unified Ideographs (U+4E00–U+9FFF). Used to decide whether to
+// translate before prose NER (which is English-only).
+func isCJKHeavy(text string) bool {
+	var total, cjk int
+	for _, r := range text {
+		total++
+		if r >= 0x4E00 && r <= 0x9FFF {
+			cjk++
+		}
+	}
+	return total > 0 && float64(cjk)/float64(total) > 0.15
+}
+
+// translateCJKBatch checks each text for CJK content. If any are CJK-heavy,
+// it sends them all in one LLM call for translation, then returns the
+// (possibly translated) texts. Falls back to the originals on any error.
+func translateCJKBatch(ctx context.Context, client *llm.Client, texts []string) []string {
+	if client == nil {
+		return texts
+	}
+
+	// Find which indices need translation.
+	var needsTranslation []int
+	for i, t := range texts {
+		if isCJKHeavy(t) {
+			needsTranslation = append(needsTranslation, i)
+		}
+	}
+	if len(needsTranslation) == 0 {
+		return texts // fast path: all English
+	}
+
+	// Build a single prompt with all CJK sections.
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Translate each of the following %d sections to English. ", len(needsTranslation)))
+	sb.WriteString("Return a JSON array of strings in the same order. No explanation.\n\n")
+	for order, idx := range needsTranslation {
+		sb.WriteString(fmt.Sprintf("=== SECTION %d ===\n%s\n\n", order+1, texts[idx]))
+	}
+
+	var translated []string
+	if err := client.JSON(ctx,
+		"You are a professional translator. Translate each section to English exactly, preserving names and technical terms.",
+		sb.String(),
+		&translated,
+	); err != nil || len(translated) != len(needsTranslation) {
+		return texts // graceful fallback: use originals
+	}
+
+	// Splice translated texts back into the result slice.
+	out := make([]string, len(texts))
+	copy(out, texts)
+	for order, idx := range needsTranslation {
+		out[idx] = translated[order]
+	}
+	return out
 }
