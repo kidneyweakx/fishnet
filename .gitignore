@@ -1,0 +1,33 @@
+# Go build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Binary built by this project
+fishnet
+
+# Coverage and profiling
+coverage.out
+coverage.txt
+*.coverprofile
+*.pprof
+cpu.prof
+mem.prof
+
+# Local app/runtime data
+.fishnet/
+sim-out/
+demo-project/
+
+# IDE/OS noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Test Fishnet
+docs/

@@ -1,0 +1,237 @@
+package cmd
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"time"
+
+	"github.com/spf13/cobra"
+
+	"fishnet/internal/db"
+	"fishnet/internal/doc"
+	"fishnet/internal/graph"
+	"fishnet/internal/llm"
+)
+
+var analyzeCmd = &cobra.Command{
+	Use:   "analyze",
+	Short: "Read documents and build knowledge graph",
+	Long: `Read all .txt/.md/.rst/.csv/.json files from the source directory,
+chunk them, extract entities via LLM, and store in the local graph.`,
+	Example: `  fishnet analyze
+  fishnet analyze --dir ./docs --concurrency 8
+  fishnet analyze --dir ./reports --chunk-size 800`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		dir, _ := cmd.Flags().GetString("dir")
+		concurrency, _ := cmd.Flags().GetInt("concurrency")
+		chunkSize, _ := cmd.Flags().GetInt("chunk-size")
+		chunkOverlap, _ := cmd.Flags().GetInt("chunk-overlap")
+		skipGraph, _ := cmd.Flags().GetBool("docs-only")
+		community, _ := cmd.Flags().GetBool("community")
+		useOntology, _ := cmd.Flags().GetBool("ontology")
+
+		if cfg.LLM.APIKey == "" {
+			// Check env
+			if k := os.Getenv("FISHNET_API_KEY"); k != "" {
+				cfg.LLM.APIKey = k
+			} else if k := os.Getenv("OPENAI_API_KEY"); k != "" {
+				cfg.LLM.APIKey = k
+			} else if k := os.Getenv("ANTHROPIC_API_KEY"); k != "" {
+				cfg.LLM.APIKey = k
+			}
+		}
+
+		// Resolve dir
+		if dir == "" {
+			dir = "."
+		}
+		absDir, _ := filepath.Abs(dir)
+
+		// Open DB
+		database, err := db.Open(cfg.DBPath)
+		if err != nil {
+			die("open db", err)
+		}
+		defer database.Close()
+
+		// Get project
+		projectID, err := database.ProjectByName(cfg.Project)
+		if err != nil {
+			// Auto-create project if not found
+			projectID, err = database.UpsertProject(cfg.Project, absDir)
+			if err != nil {
+				die("create project", err)
+			}
+			fmt.Printf("%s Auto-created project %s\n", yellow("!"), bold(cfg.Project))
+		}
+
+		// ── Step 1: Read documents ──────────────────────────────────────────
+		fmt.Printf("\n%s Reading documents from %s\n", cyan("→"), bold(absDir))
+		docs, err := doc.ReadDir(absDir)
+		if err != nil {
+			die("read dir", err)
+		}
+		if len(docs) == 0 {
+			return fmt.Errorf("no supported documents found in %s", absDir)
+		}
+		fmt.Printf("  Found %d documents\n", len(docs))
+
+		// Override chunk settings from flags
+		if chunkSize <= 0 {
+			chunkSize = cfg.Graph.ChunkSize
+		}
+		if chunkOverlap <= 0 {
+			chunkOverlap = cfg.Graph.ChunkOverlap
+		}
+
+		// ── Step 2: Chunk & store ───────────────────────────────────────────
+		fmt.Printf("\n%s Chunking (size=%d overlap=%d)...\n", cyan("→"), chunkSize, chunkOverlap)
+		totalChunks := 0
+		for _, d := range docs {
+			chunks := doc.Chunk(d.Content, chunkSize, chunkOverlap)
+			docID, err := database.AddDocument(projectID, d.Path, d.Name, d.Content, len(chunks))
+			if err != nil {
+				fmt.Printf("  skip %s: %v\n", d.Name, err)
+				continue
+			}
+			for i, c := range chunks {
+				database.AddChunk(docID, projectID, c, i)
+			}
+			totalChunks += len(chunks)
+			fmt.Printf("  %-30s → %d chunks\n", d.Name, len(chunks))
+		}
+		fmt.Printf("  Total: %d chunks\n", totalChunks)
+
+		if skipGraph {
+			fmt.Printf("\n%s Docs loaded (--docs-only). Run without flag to extract graph.\n", green("✓"))
+			return nil
+		}
+
+		// ── Step 3: Extract graph ───────────────────────────────────────────
+		chunks, err := database.UnprocessedChunks(projectID)
+		if err != nil {
+			die("get chunks", err)
+		}
+		if len(chunks) == 0 {
+			fmt.Printf("\n%s All chunks already processed.\n", green("✓"))
+		} else {
+			if cfg.LLM.APIKey == "" && cfg.LLM.Provider != "ollama" {
+				return fmt.Errorf("no API key set; run: fishnet config set api-key <key>")
+			}
+
+			client := llm.New(cfg.LLM)
+			if concurrency <= 0 {
+				concurrency = cfg.LLM.MaxConcurrency
+			}
+
+			ctx := context.Background()
+
+			// ── Step 3a: Generate ontology (optional) ───────────────────────
+			var builderCfg graph.Config
+			if useOntology && len(docs) > 0 {
+				fmt.Printf("\n%s Generating ontology schema...\n", cyan("→"))
+				sample := docs[0].Content
+				if len(sample) > 3000 {
+					sample = sample[:3000]
+				}
+				schema, ontErr := graph.GenerateOntology(ctx, client, sample)
+				if ontErr == nil {
+					builderCfg.Schema = schema
+					fmt.Printf("  Entity types: ")
+					for i, et := range schema.EntityTypes {
+						if i > 0 {
+							fmt.Printf(", ")
+						}
+						fmt.Printf("%s", et.Name)
+					}
+					fmt.Println()
+					fmt.Printf("  Edge types:   ")
+					for i, et := range schema.EdgeTypes {
+						if i > 0 {
+							fmt.Printf(", ")
+						}
+						fmt.Printf("%s", et.Name)
+					}
+					fmt.Println()
+				}
+			}
+
+			fmt.Printf("\n%s Extracting graph from %d chunks (concurrency=%d)...\n",
+				cyan("→"), len(chunks), concurrency)
+
+			start := time.Now()
+			builder := graph.NewBuilderWithConfig(database, client, builderCfg)
+
+			lastPct := -1
+			result, err := builder.BuildFromChunks(ctx, projectID, chunks, concurrency,
+				func(p graph.Progress) {
+					pct := int(p.Done * 100 / int64(p.Total))
+					if pct != lastPct && pct%5 == 0 {
+						lastPct = pct
+						bar := progressBar(pct, 30)
+						fmt.Printf("\r  [%s] %d%% (+%d nodes, +%d edges)",
+							bar, pct, p.NodesAdded, p.EdgesAdded)
+					}
+				})
+			fmt.Println()
+			if err != nil {
+				die("extract graph", err)
+			}
+
+			elapsed := time.Since(start).Round(time.Second)
+			fmt.Printf("  Done in %s: +%d nodes, +%d edges (%d errors)\n",
+				elapsed, result.NodesAdded, result.EdgesAdded, result.Errors)
+		}
+
+		// ── Step 4: Community detection (optional) ──────────────────────────
+		if community {
+			fmt.Printf("\n%s Running community detection...\n", cyan("→"))
+			client := llm.New(cfg.LLM)
+			results, err := graph.RunCommunityDetection(
+				context.Background(), database, client, projectID,
+				cfg.Graph.CommunityMinSize)
+			if err != nil {
+				fmt.Printf("  %s community detection failed: %v\n", yellow("!"), err)
+			} else {
+				fmt.Printf("  Found %d communities\n", len(results))
+				for _, c := range results {
+					fmt.Printf("  [%d] %d nodes — %s\n", c.ID, len(c.Nodes), c.Summary)
+				}
+			}
+		}
+
+		// ── Summary ─────────────────────────────────────────────────────────
+		stats := database.GetStats(projectID)
+		fmt.Printf("\n%s Graph ready: %d nodes, %d edges, %d communities\n",
+			green("✓"), stats.Nodes, stats.Edges, stats.Communities)
+		fmt.Printf("  Run: fishnet graph web   — to visualize\n")
+		fmt.Printf("       fishnet sim run     — to simulate\n")
+		return nil
+	},
+}
+
+func progressBar(pct, width int) string {
+	filled := pct * width / 100
+	bar := ""
+	for i := 0; i < width; i++ {
+		if i < filled {
+			bar += "█"
+		} else {
+			bar += "░"
+		}
+	}
+	return bar
+}
+
+func init() {
+	analyzeCmd.Flags().String("dir", "", "Documents directory (default: from config)")
+	analyzeCmd.Flags().Int("concurrency", 0, "Concurrent LLM calls (default: from config)")
+	analyzeCmd.Flags().Int("chunk-size", 0, "Characters per chunk (default: from config)")
+	analyzeCmd.Flags().Int("chunk-overlap", 0, "Overlap between chunks (default: from config)")
+	analyzeCmd.Flags().Bool("docs-only", false, "Only load docs, skip graph extraction")
+	analyzeCmd.Flags().Bool("community", false, "Run community detection after extraction")
+	analyzeCmd.Flags().Bool("ontology", true, "Generate domain ontology before extraction (default: true)")
+	rootCmd.AddCommand(analyzeCmd)
+}
