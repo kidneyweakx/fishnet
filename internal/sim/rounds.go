@@ -19,6 +19,22 @@ import (
 
 // ─── Config & Progress ────────────────────────────────────────────────────────
 
+// Simulation mode constants.
+const (
+	// ModeNoLLM — zero LLM calls per round; decisions are math-based, content
+	// is generated from local templates. Near-zero token cost.
+	ModeNoLLM = "nollm"
+
+	// ModeBatch — 1 LLM call per round (batched) for content generation;
+	// decisions are still math-based. Default mode.
+	ModeBatch = "batch"
+
+	// ModeHeavy — 1 LLM call per agent per round; LLM decides WHAT to do AND
+	// generates content in one call. Produces the most authentic, stance-aware
+	// behaviour at the cost of N*rounds total calls.
+	ModeHeavy = "heavy"
+)
+
 // RoundConfig configures a full multi-round social simulation.
 type RoundConfig struct {
 	Scenario    string
@@ -26,8 +42,19 @@ type RoundConfig struct {
 	MaxAgents   int
 	Platforms   []string // "twitter" | "reddit"
 	OutputDir   string   // dir for actions.jsonl; empty = skip
-	Concurrency int      // max concurrent LLM content calls (default 6)
+	Concurrency int      // max concurrent LLM calls (default 6)
 	SimConfig   *platform.SimConfig // optional; applied after buildPersonalities
+
+	// Mode selects the simulation fidelity level:
+	//   ModeNoLLM ("nollm") — template content, math decisions, zero LLM
+	//   ModeBatch  ("batch") — 1 batch LLM call/round for content  [default]
+	//   ModeHeavy  ("heavy") — 1 LLM call/agent/round for decisions + content
+	// The legacy NoLLM bool is still respected (maps to ModeNoLLM).
+	Mode string
+
+	// FeedWeights overrides the 4-factor ranking weights used to build each
+	// agent's timeline. nil → platform.DefaultFeedWeights.
+	FeedWeights *platform.FeedWeights
 
 	// EventConfig holds optional seeding content injected before round 1.
 	// When nil and SimConfig is set, SimConfig.EventConfig is used automatically.
@@ -47,10 +74,7 @@ type RoundConfig struct {
 	// and uses these pre-built profiles directly (loaded from a `sim prepare` snapshot).
 	Personalities []*platform.Personality
 
-	// NoLLM disables ALL LLM calls:
-	//   - Personalities use graph-node defaults (no enrichment)
-	//   - Content is generated from local templates
-	// Use when you need near-zero token cost.
+	// NoLLM disables ALL LLM calls (legacy flag; sets Mode = ModeNoLLM when Mode is "").
 	NoLLM bool
 }
 
@@ -72,11 +96,11 @@ type RoundProgress struct {
 
 // PlatformSim runs a multi-round Twitter + Reddit simulation.
 //
-// Efficiency model:
-//   - Agent personality: LLM call once at startup (concurrent)
-//   - Per-round decisions: deterministic math (no LLM)
-//   - Content generation: LLM only for CREATE_POST / COMMENT actions
-//   - This reduces LLM calls by ~15-20x compared to OASIS
+// Efficiency model (by mode):
+//
+//	ModeNoLLM — zero LLM calls; math decisions + template content
+//	ModeBatch  — 1 batch LLM call/round for content; math decisions  [default]
+//	ModeHeavy  — 1 LLM call/agent/round; LLM decides + generates content
 type PlatformSim struct {
 	db  *db.DB
 	llm *llm.Client
@@ -99,6 +123,21 @@ func (ps *PlatformSim) Run(
 	}
 	if cfg.MaxRounds <= 0 {
 		cfg.MaxRounds = 10
+	}
+
+	// ── Resolve mode ─────────────────────────────────────────────────────────
+	if cfg.Mode == "" {
+		if cfg.NoLLM {
+			cfg.Mode = ModeNoLLM
+		} else {
+			cfg.Mode = ModeBatch
+		}
+	}
+
+	// ── Resolve feed weights ─────────────────────────────────────────────────
+	feedWeights := platform.DefaultFeedWeights
+	if cfg.FeedWeights != nil {
+		feedWeights = *cfg.FeedWeights
 	}
 
 	// ── Graph memory updater (optional) ──────────────────────────────────────
@@ -124,17 +163,24 @@ func (ps *PlatformSim) Run(
 	var personalities []*platform.Personality
 	if len(cfg.Personalities) > 0 {
 		personalities = cfg.Personalities
-	} else if cfg.NoLLM {
+	} else if cfg.Mode == ModeNoLLM {
 		personalities = ps.buildPersonalitiesLow(nodes, cfg.SimConfig)
 	} else {
 		personalities = ps.buildPersonalities(ctx, nodes, cfg.Scenario, cfg.Concurrency, cfg.SimConfig)
 	}
 
-	// ── Build InfluenceWeight lookup map ─────────────────────────────────────
+	// ── Build persona fingerprints for token compression (skip in NoLLM mode) ──
+	if cfg.Mode != ModeNoLLM {
+		ps.buildFingerprints(ctx, personalities, cfg.Concurrency)
+	}
+
+	// ── Build InfluenceWeight and CommunityID lookup maps ────────────────────
 	influenceByID := make(map[string]float64, len(personalities))
+	communityByID := make(map[string]int, len(personalities))
 	for _, p := range personalities {
 		if p != nil {
 			influenceByID[p.AgentID] = p.InfluenceWeight
+			communityByID[p.AgentID] = p.CommunityID
 		}
 	}
 
@@ -341,119 +387,239 @@ func (ps *PlatformSim) Run(
 		twState.UpdateTrending()
 		rdState.UpdateTrending()
 
-		// ── Phase 1: decide (parallel, zero LLM) ─────────────────────────
-		// Each agent picks actions based on their timeline. Non-LLM actions
-		// (LIKE, REPOST, FOLLOW) are executed immediately. Content-generation
-		// actions (CREATE_POST, COMMENT, QUOTE_POST) are collected for batching.
-		var roundBatch []contentItem
-		var roundBatchMu sync.Mutex
+		if cfg.Mode == ModeHeavy {
+			// ════════════════════════════════════════════════════════════════
+			// Heavy mode: 1 LLM call per agent — decides + generates content.
+			// ════════════════════════════════════════════════════════════════
+			sem := make(chan struct{}, cfg.Concurrency)
+			var wg sync.WaitGroup
+			for _, p := range personalities {
+				wg.Add(1)
+				go func(pers *platform.Personality) {
+					defer wg.Done()
+					sem <- struct{}{}
+					defer func() { <-sem }()
 
-		var wg sync.WaitGroup
-		for _, p := range personalities {
-			wg.Add(1)
-			go func(pers *platform.Personality) {
-				defer wg.Done()
-
-				if hasPlatform(cfg.Platforms, "twitter") {
-					tl := weightedTimeline(twState, pers.AgentID, influenceByID, 10, round)
-					for _, planned := range pers.DecideFromTimeline(tl, cfg.Scenario, round, "twitter") {
-						if !planned.NeedLLM {
-							if a := execNoLLM(pers, planned, twState, round); a != nil {
-								emit(*a)
+					runHeavyPlatform := func(state *platform.State, platName string) {
+						tl := platform.RankedFeed(state, pers, 10, influenceByID, feedWeights, round, communityByID)
+						results := ps.heavyDecide(ctx, pers, tl, cfg.Scenario, round, platName)
+						for _, res := range results {
+							planned := res.Action
+							content := res.Content
+							logParts := []string{}
+							if res.Reason != "" {
+								logParts = append(logParts, "["+pers.Name+"] "+res.Reason)
 							}
-						} else {
-							roundBatchMu.Lock()
-							roundBatch = append(roundBatch, contentItem{pers, planned, twState})
-							roundBatchMu.Unlock()
+
+							switch planned.Type {
+							case platform.ActCreatePost, platform.ActQuotePost, platform.ActCreateComment:
+								if content == "" {
+									content = genContentTemplate(pers, planned.Topic, planned.Type, platName, round)
+								}
+								post := &platform.Post{
+									ID:         uuid.New().String(),
+									Platform:   platName,
+									AuthorID:   pers.AgentID,
+									AuthorName: pers.Name,
+									Content:    content,
+									ParentID:   planned.PostID,
+									Timestamp:  time.Now(),
+									Tags:       platform.ExtractTags(content),
+								}
+								if platName == "reddit" {
+									post.Subreddit = pickSub(pers.Interests)
+								}
+								state.AddPost(post)
+								if planned.PostID != "" {
+									// Quote/comment on someone else's post → record interaction
+									if authorID := state.PostAuthorID(planned.PostID); authorID != "" {
+										state.RecordInteraction(pers.AgentID, authorID)
+									}
+								}
+								emit(platform.Action{
+									Round: round, Timestamp: time.Now(),
+									Platform:  platName,
+									AgentID:   pers.AgentID, AgentName: pers.Name,
+									Type: planned.Type, PostID: post.ID,
+									Content: content, Success: true,
+									Error: strings.Join(logParts, "; "),
+								})
+
+							default:
+								if a := execNoLLM(pers, planned, state, round); a != nil {
+									// Record interactions for likes/reposts
+									if planned.PostID != "" {
+										switch planned.Type {
+										case platform.ActLikePost, platform.ActRepost,
+											platform.ActDislikePost, platform.ActLikeComment:
+											if authorID := state.PostAuthorID(planned.PostID); authorID != "" {
+												state.RecordInteraction(pers.AgentID, authorID)
+											}
+										}
+									}
+									// Drive interest drift from liked/reposted content
+									if planned.PostID != "" {
+										switch planned.Type {
+										case platform.ActLikePost, platform.ActRepost:
+											tags := state.PostTags(planned.PostID)
+											if len(tags) > 0 {
+												state.RecordLikedTags(pers.AgentID, tags)
+											}
+										}
+									}
+									if platName == "reddit" {
+										a.Platform = "reddit"
+									}
+									if len(logParts) > 0 {
+										a.Error = strings.Join(logParts, "; ")
+									}
+									emit(*a)
+								}
+							}
 						}
 					}
-				}
-				if hasPlatform(cfg.Platforms, "reddit") {
-					tl := weightedTimeline(rdState, pers.AgentID+"_rd", influenceByID, 10, round)
-					for _, planned := range pers.DecideFromTimeline(tl, cfg.Scenario, round, "reddit") {
-						if !planned.NeedLLM {
-							if a := execNoLLM(pers, planned, rdState, round); a != nil {
-								a.Platform = "reddit"
-								emit(*a)
+
+					if hasPlatform(cfg.Platforms, "twitter") {
+						runHeavyPlatform(twState, "twitter")
+					}
+					if hasPlatform(cfg.Platforms, "reddit") {
+						runHeavyPlatform(rdState, "reddit")
+					}
+				}(p)
+			}
+			wg.Wait()
+		} else {
+			// ════════════════════════════════════════════════════════════════
+			// Batch / NoLLM mode
+			// Phase 1: math-based decide (parallel, zero LLM).
+			//   Non-content actions execute immediately.
+			//   Content actions collected for batch generation.
+			// ════════════════════════════════════════════════════════════════
+			var roundBatch []contentItem
+			var roundBatchMu sync.Mutex
+
+			var wg sync.WaitGroup
+			for _, p := range personalities {
+				wg.Add(1)
+				go func(pers *platform.Personality) {
+					defer wg.Done()
+
+					runBatchPlatform := func(state *platform.State, platName string) {
+						tl := platform.RankedFeed(state, pers, 10, influenceByID, feedWeights, round, communityByID)
+						for _, planned := range pers.DecideFromTimeline(tl, cfg.Scenario, round, platName) {
+							if !planned.NeedLLM {
+								if a := execNoLLM(pers, planned, state, round); a != nil {
+									// Record interactions for likes/reposts
+									if planned.PostID != "" {
+										switch planned.Type {
+										case platform.ActLikePost, platform.ActRepost,
+											platform.ActDislikePost, platform.ActLikeComment:
+											if authorID := state.PostAuthorID(planned.PostID); authorID != "" {
+												state.RecordInteraction(pers.AgentID, authorID)
+											}
+										}
+									}
+									// Drive interest drift from liked/reposted content
+									if planned.PostID != "" {
+										switch planned.Type {
+										case platform.ActLikePost, platform.ActRepost:
+											tags := state.PostTags(planned.PostID)
+											if len(tags) > 0 {
+												state.RecordLikedTags(pers.AgentID, tags)
+											}
+										}
+									}
+									if platName == "reddit" {
+										a.Platform = "reddit"
+									}
+									emit(*a)
+								}
+							} else {
+								roundBatchMu.Lock()
+								roundBatch = append(roundBatch, contentItem{pers, planned, state})
+								roundBatchMu.Unlock()
 							}
-						} else {
-							roundBatchMu.Lock()
-							roundBatch = append(roundBatch, contentItem{pers, planned, rdState})
-							roundBatchMu.Unlock()
 						}
 					}
+
+					if hasPlatform(cfg.Platforms, "twitter") {
+						runBatchPlatform(twState, "twitter")
+					}
+					if hasPlatform(cfg.Platforms, "reddit") {
+						runBatchPlatform(rdState, "reddit")
+					}
+				}(p)
+			}
+			wg.Wait()
+
+			// ── Phase 2: batch content generation ────────────────────────────
+			if len(roundBatch) > 0 {
+				var contents []string
+				var batchErr error
+
+				if cfg.Mode == ModeNoLLM {
+					contents = make([]string, len(roundBatch))
+					for i, it := range roundBatch {
+						contents[i] = genContentTemplate(it.pers, it.planned.Topic, it.planned.Type, it.state.Platform, round)
+					}
+				} else {
+					contents, batchErr = ps.batchGenContent(ctx, roundBatch, round)
 				}
-			}(p)
-		}
-		wg.Wait()
 
-		// ── Phase 2: batch content generation ────────────────────────────
-		// Default: one LLM call per round for all content (batch JSON).
-		// NoLLM: pure templates, zero LLM calls.
-		if len(roundBatch) > 0 {
-			var contents []string
-			var batchErr error
-
-			if cfg.NoLLM {
-				contents = make([]string, len(roundBatch))
+				// ── Phase 3: create posts + emit ─────────────────────────────
 				for i, it := range roundBatch {
-					contents[i] = genContentTemplate(it.pers, it.planned.Topic, it.planned.Type, it.state.Platform, round)
-				}
-			} else {
-				contents, batchErr = ps.batchGenContent(ctx, roundBatch, round)
-			}
+					if batchErr != nil {
+						emit(platform.Action{
+							Round: round, Timestamp: time.Now(),
+							Platform:  it.state.Platform,
+							AgentID:   it.pers.AgentID, AgentName: it.pers.Name,
+							Type:    it.planned.Type,
+							Success: false, Error: batchErr.Error(),
+						})
+						continue
+					}
 
-			// ── Phase 3: create posts + emit ─────────────────────────────
-			for i, it := range roundBatch {
-				if batchErr != nil {
+					content := ""
+					if i < len(contents) {
+						content = contents[i]
+					}
+					if content == "" {
+						content = genContentTemplate(it.pers, it.planned.Topic, it.planned.Type, it.state.Platform, round)
+					}
+
+					post := &platform.Post{
+						ID:         uuid.New().String(),
+						Platform:   it.state.Platform,
+						AuthorID:   it.pers.AgentID,
+						AuthorName: it.pers.Name,
+						Content:    content,
+						ParentID:   it.planned.PostID,
+						Timestamp:  time.Now(),
+						Tags:       platform.ExtractTags(content),
+					}
+					if it.state.Platform == "reddit" {
+						post.Subreddit = pickSub(it.pers.Interests)
+					}
+					it.state.AddPost(post)
+					// Record interaction for quote/comment (replying to someone)
+					if it.planned.PostID != "" {
+						if authorID := it.state.PostAuthorID(it.planned.PostID); authorID != "" {
+							it.state.RecordInteraction(it.pers.AgentID, authorID)
+						}
+					}
+
 					emit(platform.Action{
-						Round: round, Timestamp: time.Now(),
+						Round:     round,
+						Timestamp: time.Now(),
 						Platform:  it.state.Platform,
-						AgentID:   it.pers.AgentID,
-						AgentName: it.pers.Name,
-						Type:      it.planned.Type,
-						Success:   false,
-						Error:     batchErr.Error(),
+						AgentID:   it.pers.AgentID, AgentName: it.pers.Name,
+						Type:    it.planned.Type,
+						PostID:  post.ID, Content: content,
+						Success: true,
 					})
-					continue
 				}
-
-				content := ""
-				if i < len(contents) {
-					content = contents[i]
-				}
-				if content == "" {
-					content = genContentTemplate(it.pers, it.planned.Topic, it.planned.Type, it.state.Platform, round)
-				}
-
-				post := &platform.Post{
-					ID:         uuid.New().String(),
-					Platform:   it.state.Platform,
-					AuthorID:   it.pers.AgentID,
-					AuthorName: it.pers.Name,
-					Content:    content,
-					ParentID:   it.planned.PostID,
-					Timestamp:  time.Now(),
-					Tags:       platform.ExtractTags(content),
-				}
-				if it.state.Platform == "reddit" {
-					post.Subreddit = pickSub(it.pers.Interests)
-				}
-				it.state.AddPost(post)
-
-				emit(platform.Action{
-					Round:     round,
-					Timestamp: time.Now(),
-					Platform:  it.state.Platform,
-					AgentID:   it.pers.AgentID,
-					AgentName: it.pers.Name,
-					Type:      it.planned.Type,
-					PostID:    post.ID,
-					Content:   content,
-					Success:   true,
-				})
 			}
-		}
+		} // end batch/nollm branch
 
 		// ── Flush graph memory edges for this round ───────────────────────
 		if memUpdater != nil {
@@ -484,84 +650,6 @@ func (ps *PlatformSim) Run(
 	return nil
 }
 
-// weightedTimeline fetches recent posts from state and sorts/samples them
-// weighted by the InfluenceWeight of their authors. Higher-influence authors'
-// posts are more likely to appear in the agent's visible timeline.
-func weightedTimeline(state *platform.State, agentID string, influenceByID map[string]float64, limit int, round int) []*platform.Post {
-	// Fetch a larger pool than needed so we can apply weights
-	pool := state.RecentPostsExcluding(agentID, limit*4)
-	if len(pool) == 0 {
-		return nil
-	}
-
-	// Build cumulative weight array
-	weights := make([]float64, len(pool))
-	total := 0.0
-	for i, post := range pool {
-		// Look up influence weight; strip "_rd" suffix for Reddit user IDs
-		authorID := post.AuthorID
-		w, ok := influenceByID[authorID]
-		if !ok {
-			// Try stripping reddit suffix
-			stripped := strings.TrimSuffix(authorID, "_rd")
-			w, ok = influenceByID[stripped]
-			if !ok {
-				w = 1.0 // default weight
-			}
-		}
-		if w <= 0 {
-			w = 0.01
-		}
-		total += w
-		weights[i] = total
-	}
-
-	if total == 0 {
-		return pool
-	}
-
-	// Weighted sampling without replacement
-	rng := rand.New(rand.NewSource(int64(round)*3571 + platform.HashStr(agentID)))
-	selected := make([]*platform.Post, 0, limit)
-	remaining := append([]*platform.Post(nil), pool...)
-	remWeights := append([]float64(nil), weights...)
-
-	for len(selected) < limit && len(remaining) > 0 {
-		r := rng.Float64() * remWeights[len(remWeights)-1]
-		// Binary search for the chosen index
-		lo, hi := 0, len(remWeights)-1
-		for lo < hi {
-			mid := (lo + hi) / 2
-			if remWeights[mid] < r {
-				lo = mid + 1
-			} else {
-				hi = mid
-			}
-		}
-		selected = append(selected, remaining[lo])
-		// Remove chosen item and recompute cumulative weights
-		remaining = append(remaining[:lo], remaining[lo+1:]...)
-		remWeights = remWeights[:len(remaining)]
-		cum := 0.0
-		for j, post := range remaining {
-			authorID := post.AuthorID
-			w, ok := influenceByID[authorID]
-			if !ok {
-				stripped := strings.TrimSuffix(authorID, "_rd")
-				w, ok = influenceByID[stripped]
-				if !ok {
-					w = 1.0
-				}
-			}
-			if w <= 0 {
-				w = 0.01
-			}
-			cum += w
-			remWeights[j] = cum
-		}
-	}
-	return selected
-}
 
 // ─── Action Execution ─────────────────────────────────────────────────────────
 
@@ -742,6 +830,48 @@ func (ps *PlatformSim) buildPersonalities(
 	}
 
 	return results
+}
+
+// buildFingerprints generates a compressed persona fingerprint for each personality
+// using concurrent LLM calls. Falls back to a template if LLM fails.
+// Fingerprints are cached in p.Fingerprint and reused every round.
+func (ps *PlatformSim) buildFingerprints(ctx context.Context, personalities []*platform.Personality, concurrency int) {
+	sem := make(chan struct{}, concurrency)
+	var wg sync.WaitGroup
+	for _, p := range personalities {
+		if p == nil || p.Fingerprint != "" {
+			continue
+		}
+		wg.Add(1)
+		go func(pers *platform.Personality) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			prompt := fmt.Sprintf("%s|%s|%s|stance:%s|style:%s|interests:%s",
+				pers.Name, pers.NodeType, truncScenario(pers.Bio),
+				pers.Stance, pers.PostStyle,
+				strings.Join(pers.Interests, ","))
+
+			const sys = `Compress this agent persona into a single line ≤60 words for a social media simulation prompt.
+Include: name, role, stance, posting style, top 2-3 interests. Be specific and terse.
+Output ONLY the compressed line, no JSON, no labels.`
+
+			result, err := ps.llm.System(ctx, sys, prompt)
+			if err != nil || result == "" {
+				// Fallback: template fingerprint
+				interests := strings.Join(pers.Interests, ", ")
+				if len([]rune(interests)) > 40 {
+					interests = string([]rune(interests)[:40]) + "…"
+				}
+				pers.Fingerprint = fmt.Sprintf("%s | %s | stance:%s | style:%s | interests:%s",
+					pers.Name, pers.NodeType, pers.Stance, pers.PostStyle, interests)
+			} else {
+				pers.Fingerprint = strings.TrimSpace(result)
+			}
+		}(p)
+	}
+	wg.Wait()
 }
 
 // ─── Pause / Resume ───────────────────────────────────────────────────────────

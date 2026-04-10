@@ -17,6 +17,7 @@ func (ps *PlatformSim) batchGenContent(ctx context.Context, items []contentItem,
 		Agent        string   `json:"agent"`
 		NodeType     string   `json:"node_type"`
 		Profession   string   `json:"profession,omitempty"`
+		Fingerprint  string   `json:"fingerprint,omitempty"`
 		Bio          string   `json:"bio,omitempty"`
 		Interests    []string `json:"interests,omitempty"`
 		Catchphrases []string `json:"catchphrases,omitempty"`
@@ -41,11 +42,17 @@ func (ps *PlatformSim) batchGenContent(ctx context.Context, items []contentItem,
 		if len([]rune(bio)) > 150 {
 			bio = string([]rune(bio)[:150]) + "…"
 		}
+		fingerprint := it.pers.Fingerprint
+		// If fingerprint is set, truncate bio since fingerprint covers it
+		if fingerprint != "" && len([]rune(bio)) > 80 {
+			bio = string([]rune(bio)[:80]) + "…"
+		}
 		reqs[i] = reqItem{
 			ID:           i,
 			Agent:        it.pers.Name,
 			NodeType:     it.pers.NodeType,
 			Profession:   it.pers.Profession,
+			Fingerprint:  fingerprint,
 			Bio:          bio,
 			Interests:    it.pers.Interests,
 			Catchphrases: it.pers.Catchphrases,
@@ -67,6 +74,7 @@ Input: JSON array of content requests with agent persona details.
 Output: JSON array of {"id": <number>, "content": "<post text>"} objects.
 
 Rules:
+- If 'fingerprint' is provided, use it as the primary persona description instead of bio
 - Write in the agent's voice — use their bio, profession, and interests to shape the post
 - If catchphrases are provided, occasionally weave one in naturally
 - Match stance (supportive/opposing/observer/neutral) and sentiment

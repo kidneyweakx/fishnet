@@ -56,6 +56,11 @@ type Personality struct {
 	// Graph community this agent belongs to (from Louvain detection, -1 if none)
 	CommunityID      int    `json:"community_id"`
 	CommunitySummary string `json:"community_summary"`
+
+	// Fingerprint is a compressed ~50-word summary of this agent's persona,
+	// generated once by LLM and cached for use in every round's prompt.
+	// Empty until BuildFingerprint is called.
+	Fingerprint string `json:"fingerprint"`
 }
 
 // FromNode creates a default personality from a graph node (no LLM).

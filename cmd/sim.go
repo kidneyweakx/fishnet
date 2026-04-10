@@ -146,6 +146,7 @@ Each agent makes LLM-free decisions each round; LLM is only used to generate pos
 		quiet, _ := cmd.Flags().GetBool("quiet")
 		graphMemory, _ := cmd.Flags().GetBool("graph-memory")
 		noLLM, _ := cmd.Flags().GetBool("no-llm")
+		simMode, _ := cmd.Flags().GetString("mode")
 		sessionRef, _ := cmd.Flags().GetString("session")
 
 		// ── Load from prepared session if --session is given ─────────────────
@@ -228,8 +229,18 @@ Each agent makes LLM-free decisions each round; LLM is only used to generate pos
 		if len(prebuiltPersonalities) > 0 {
 			preparedNote = fmt.Sprintf(" [%d pre-built agents]", len(prebuiltPersonalities))
 		}
-		fmt.Printf("\n%s Platform simulation\n  Scenario:  %s\n  Rounds:    %d\n  Platforms: %s%s\n\n",
-			cyan("→"), bold(scenario), rounds, platLabel, preparedNote)
+		// Resolve mode: --mode flag > --no-llm > default batch
+		resolvedMode := simMode
+		if resolvedMode == "" && noLLM {
+			resolvedMode = sim.ModeNoLLM
+		}
+		modeLabel := resolvedMode
+		if modeLabel == "" {
+			modeLabel = sim.ModeBatch
+		}
+
+		fmt.Printf("\n%s Platform simulation\n  Scenario:  %s\n  Rounds:    %d\n  Platforms: %s\n  Mode:      %s%s\n\n",
+			cyan("→"), bold(scenario), rounds, platLabel, modeLabel, preparedNote)
 
 		// ── Create SimRun record ─────────────────────────────────────────────
 		runMgr := simrun.NewManager(".")
@@ -256,7 +267,8 @@ Each agent makes LLM-free decisions each round; LLM is only used to generate pos
 				Concurrency:       concurrency,
 				EnableGraphMemory: graphMemory,
 				Personalities:     prebuiltPersonalities,
-				NoLLM:             noLLM,
+				Mode:              resolvedMode,
+			NoLLM:             noLLM,
 			}, progressCh)
 		}()
 
@@ -549,6 +561,7 @@ func init() {
 	simPlatformCmd.Flags().BoolVar(&simGraphMemory, "graph-memory", false, "write simulation actions back to knowledge graph")
 	simPlatformCmd.Flags().String("session", "", "Load scenario/agents from a prepared session (skips personality build)")
 	simPlatformCmd.Flags().Bool("no-llm", false, "Template-only mode: zero LLM calls, use local templates for all content")
+	simPlatformCmd.Flags().String("mode", "", "Simulation fidelity: nollm | batch (default) | heavy (1 LLM call/agent/round)")
 
 	// sim oasis flags
 	simOasisCmd.Flags().String("scenario", "", "Simulation scenario (required)")

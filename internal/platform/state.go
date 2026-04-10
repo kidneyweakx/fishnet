@@ -178,14 +178,107 @@ type State struct {
 	Users     map[string]*User
 	postOrder []string // chronological
 	trending  []string
+
+	// interactions tracks how many times a viewer has engaged with each author.
+	// interactions[viewerID][authorID] = count
+	// Used by the 4-factor feed ranking to compute the Relationship signal.
+	interactions map[string]map[string]int
+
+	// interestDrift tracks tag frequency accumulated from liked posts per agent.
+	// interestDrift[agentID][tag] = count of times agent liked content with this tag
+	interestDrift map[string]map[string]int
 }
 
 func NewState(platform string) *State {
 	return &State{
-		Platform: platform,
-		Posts:    make(map[string]*Post),
-		Users:    make(map[string]*User),
+		Platform:      platform,
+		Posts:         make(map[string]*Post),
+		Users:         make(map[string]*User),
+		interactions:  make(map[string]map[string]int),
+		interestDrift: make(map[string]map[string]int),
 	}
+}
+
+// RecordInteraction notes that viewerID engaged with content by authorID.
+// Called after LIKE_POST, REPOST, CREATE_COMMENT, and QUOTE_POST actions.
+func (s *State) RecordInteraction(viewerID, authorID string) {
+	if viewerID == "" || authorID == "" || viewerID == authorID {
+		return
+	}
+	s.mu.Lock()
+	if s.interactions[viewerID] == nil {
+		s.interactions[viewerID] = make(map[string]int)
+	}
+	s.interactions[viewerID][authorID]++
+	s.mu.Unlock()
+}
+
+// GetInteractionCount returns how many times viewerID has engaged with authorID's content.
+func (s *State) GetInteractionCount(viewerID, authorID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if m, ok := s.interactions[viewerID]; ok {
+		return m[authorID]
+	}
+	return 0
+}
+
+// RecordLikedTags records the tags from a post that agentID liked.
+// Called after LIKE_POST and REPOST actions to drive interest drift.
+func (s *State) RecordLikedTags(agentID string, tags []string) {
+	if agentID == "" || len(tags) == 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.interestDrift[agentID] == nil {
+		s.interestDrift[agentID] = make(map[string]int)
+	}
+	for _, tag := range tags {
+		if tag != "" {
+			s.interestDrift[agentID][normTag(tag)]++
+		}
+	}
+	s.mu.Unlock()
+}
+
+// GetInterestDrift returns a copy of the interest drift map for agentID.
+func (s *State) GetInterestDrift(agentID string) map[string]int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	src := s.interestDrift[agentID]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make(map[string]int, len(src))
+	for k, v := range src {
+		out[k] = v
+	}
+	return out
+}
+
+// PostTags returns the tags for a post, or nil if the post is not found.
+func (s *State) PostTags(postID string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if p, ok := s.Posts[postID]; ok {
+		return append([]string{}, p.Tags...)
+	}
+	return nil
+}
+
+// normTag normalises a tag string to lowercase trimmed form.
+func normTag(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
+}
+
+// PostAuthorID returns the AuthorID of a post, or "" if the post is not found.
+func (s *State) PostAuthorID(postID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if p, ok := s.Posts[postID]; ok {
+		return p.AuthorID
+	}
+	return ""
 }
 
 // RegisterUser adds a user to the platform.
