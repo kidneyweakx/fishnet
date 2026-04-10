@@ -28,8 +28,10 @@ type ExportDoc struct {
 	BDReport    string            `json:"bd_report"`    // markdown
 	KeyAgents   string            `json:"key_agents"`   // markdown
 	Tactics     string            `json:"tactics"`      // markdown
+	Metrics     string            `json:"metrics"`      // markdown analytics report
 	TopQuotes   []PostQuote       `json:"top_quotes"`   // twitter/reddit highlights
 	AgentQuotes map[string]string `json:"agent_quotes"` // agent name → best quote
+	SimMetrics  *SimMetrics       `json:"sim_metrics"`  // raw computed metrics
 }
 
 // PostQuote is a highlighted post with its engagement stats.
@@ -45,7 +47,7 @@ type PostQuote struct {
 // ─── GenerateExport ───────────────────────────────────────────────────────────
 
 // GenerateExport analyzes simulation actions and produces a full export document.
-// It makes 1 LLM call for the strategic documents.
+// It makes 1 LLM call for the strategic documents plus computes all analytics metrics.
 func GenerateExport(ctx context.Context, client *llm.Client, input *ExportInput) (*ExportDoc, error) {
 	// 1. Compute post engagement from actions
 	postIndex := buildPostIndex(input.Actions)
@@ -56,10 +58,14 @@ func GenerateExport(ctx context.Context, client *llm.Client, input *ExportInput)
 	// 3. Agent best quote: highest-reaction post per agent
 	agentQuotes := agentBestQuotes(postIndex, topQuotes)
 
-	// 4. Build compact simulation summary for LLM
-	summary := buildSimSummary(input, topQuotes)
+	// 4. Compute diffusion analytics
+	metrics := ComputeMetrics(input.Actions, input.Personalities)
+	metricsReport := RenderMetricsReport(metrics)
 
-	// 5. Single LLM call → all three strategic documents
+	// 5. Build compact simulation summary for LLM (includes R0 for context)
+	summary := buildSimSummary(input, topQuotes, metrics)
+
+	// 6. Single LLM call → all three strategic documents
 	type analysisResult struct {
 		BDReport  string `json:"bd_report"`
 		KeyAgents string `json:"key_agents"`
@@ -70,9 +76,9 @@ func GenerateExport(ctx context.Context, client *llm.Client, input *ExportInput)
 Return exactly: {"bd_report":"...","key_agents":"...","tactics":"..."}
 Each field must be a markdown string.
 
-bd_report: Executive summary, audience insights, message resonance, key findings (500-700 words).
+bd_report: Executive summary, audience insights, message resonance, key findings (500-700 words). Reference R0 and K-core data where relevant.
 key_agents: Identify and rank the most influential simulation agents with evidence from their posts (300-400 words).
-tactics: "If you want this narrative to develop further" — concrete tactical recommendations, core methods, intervention points (300-400 words).`
+tactics: Concrete tactical recommendations — what ACTIONS most influence the public in this simulation? Reference branching factor, time-to-peak, and influencer patterns (300-400 words).`
 
 	prompt := fmt.Sprintf("Scenario: %s\nRounds: %d\n\n%s", input.Scenario, input.Rounds, summary)
 
@@ -85,8 +91,10 @@ tactics: "If you want this narrative to develop further" — concrete tactical r
 		BDReport:    result.BDReport,
 		KeyAgents:   result.KeyAgents,
 		Tactics:     result.Tactics,
+		Metrics:     metricsReport,
 		TopQuotes:   topQuotes,
 		AgentQuotes: agentQuotes,
+		SimMetrics:  &metrics,
 	}, nil
 }
 
@@ -174,7 +182,7 @@ func agentBestQuotes(idx map[string]*postRecord, top []PostQuote) map[string]str
 
 // ─── Summary builder ──────────────────────────────────────────────────────────
 
-func buildSimSummary(input *ExportInput, topQuotes []PostQuote) string {
+func buildSimSummary(input *ExportInput, topQuotes []PostQuote, m SimMetrics) string {
 	var sb strings.Builder
 
 	// Action type counts
@@ -190,6 +198,8 @@ func buildSimSummary(input *ExportInput, topQuotes []PostQuote) string {
 	sb.WriteString(fmt.Sprintf("Total actions: %d\n", len(input.Actions)))
 	sb.WriteString(fmt.Sprintf("Action breakdown: %s\n", formatCounts(typeCounts)))
 	sb.WriteString(fmt.Sprintf("Platform split: %s\n", formatCounts(platformCounts)))
+	sb.WriteString(fmt.Sprintf("Branching Factor (R0): %.2f | K-core max: %d | Avg polarity: %.2f\n",
+		m.BranchingFactor, len(m.KCoreReach), avgSlice(m.SentimentPolarity)))
 
 	// Most active agents
 	type agentStat struct{ name string; count int }
@@ -235,6 +245,17 @@ func buildSimSummary(input *ExportInput, topQuotes []PostQuote) string {
 	return sb.String()
 }
 
+func avgSlice(s []float64) float64 {
+	if len(s) == 0 {
+		return 0
+	}
+	sum := 0.0
+	for _, v := range s {
+		sum += v
+	}
+	return sum / float64(len(s))
+}
+
 func formatCounts(m map[string]int) string {
 	type kv struct{ k string; v int }
 	pairs := make([]kv, 0, len(m))
@@ -268,6 +289,12 @@ func SaveExport(doc *ExportDoc, dir string) error {
 	// tactics.md
 	if err := os.WriteFile(dir+"/tactics.md", []byte(doc.Tactics), 0644); err != nil {
 		return err
+	}
+	// metrics.md
+	if doc.Metrics != "" {
+		if err := os.WriteFile(dir+"/metrics.md", []byte(doc.Metrics), 0644); err != nil {
+			return err
+		}
 	}
 
 	// quotes.json
