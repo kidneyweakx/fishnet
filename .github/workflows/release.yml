@@ -1,0 +1,38 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    name: goreleaser
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Run GoReleaser (cross)
+        run: |
+          docker run --rm --privileged \
+            -v "$PWD":/go/src/github.com/kidneyweakx/fishnet \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -w /go/src/github.com/kidneyweakx/fishnet \
+            -e GITHUB_TOKEN \
+            -e HOMEBREW_TAP_GITHUB_TOKEN \
+            ghcr.io/goreleaser/goreleaser-cross:v1.24 \
+            release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
