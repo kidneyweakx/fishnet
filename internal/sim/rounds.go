@@ -42,6 +42,16 @@ type RoundConfig struct {
 
 	// CopyReaction support: if non-nil, inject copy and collect reactions at InjectRound.
 	CopyReaction *CopyReactionConfig
+
+	// Personalities, when non-nil, skips the LLM personality-building phase
+	// and uses these pre-built profiles directly (loaded from a `sim prepare` snapshot).
+	Personalities []*platform.Personality
+
+	// NoLLM disables ALL LLM calls:
+	//   - Personalities use graph-node defaults (no enrichment)
+	//   - Content is generated from local templates
+	// Use when you need near-zero token cost.
+	NoLLM bool
 }
 
 // RoundProgress is one event emitted during simulation.
@@ -110,7 +120,15 @@ func (ps *PlatformSim) Run(
 	}
 
 	// ── Build personalities (LLM, parallel) ──────────────────────────────────
-	personalities := ps.buildPersonalities(ctx, nodes, cfg.Scenario, cfg.Concurrency, cfg.SimConfig)
+	// Skip if pre-built personalities were supplied (via `sim prepare`).
+	var personalities []*platform.Personality
+	if len(cfg.Personalities) > 0 {
+		personalities = cfg.Personalities
+	} else if cfg.NoLLM {
+		personalities = ps.buildPersonalitiesLow(nodes, cfg.SimConfig)
+	} else {
+		personalities = ps.buildPersonalities(ctx, nodes, cfg.Scenario, cfg.Concurrency, cfg.SimConfig)
+	}
 
 	// ── Build InfluenceWeight lookup map ─────────────────────────────────────
 	influenceByID := make(map[string]float64, len(personalities))
@@ -151,8 +169,6 @@ func (ps *PlatformSim) Run(
 		}
 	}
 
-	sem := make(chan struct{}, cfg.Concurrency)
-
 	// roundActions accumulates actions within a single round for graph memory.
 	var roundActions []platform.Action
 	var roundActionsMu sync.Mutex
@@ -162,12 +178,17 @@ func (ps *PlatformSim) Run(
 			outFile.Write(a.MarshalLine())
 		}
 		if progressCh != nil {
+			var logs []string
+			if !a.Success && a.Error != "" {
+				logs = []string{fmt.Sprintf("[%s/%s] %s: %s", a.Platform, a.AgentName, a.Type, a.Error)}
+			}
 			progressCh <- RoundProgress{
 				Round:       a.Round,
 				MaxRounds:   cfg.MaxRounds,
 				Action:      a,
 				TwitterStat: twState.GetStats(),
 				RedditStat:  rdState.GetStats(),
+				Logs:        logs,
 			}
 		}
 		if memUpdater != nil && a.AgentName != "" {
@@ -320,6 +341,13 @@ func (ps *PlatformSim) Run(
 		twState.UpdateTrending()
 		rdState.UpdateTrending()
 
+		// ── Phase 1: decide (parallel, zero LLM) ─────────────────────────
+		// Each agent picks actions based on their timeline. Non-LLM actions
+		// (LIKE, REPOST, FOLLOW) are executed immediately. Content-generation
+		// actions (CREATE_POST, COMMENT, QUOTE_POST) are collected for batching.
+		var roundBatch []contentItem
+		var roundBatchMu sync.Mutex
+
 		var wg sync.WaitGroup
 		for _, p := range personalities {
 			wg.Add(1)
@@ -327,22 +355,31 @@ func (ps *PlatformSim) Run(
 				defer wg.Done()
 
 				if hasPlatform(cfg.Platforms, "twitter") {
-					// Weight timeline sampling by InfluenceWeight
-					tweightedTimeline := weightedTimeline(twState, pers.AgentID, influenceByID, 10, round)
-					for _, planned := range pers.DecideFromTimeline(tweightedTimeline, cfg.Scenario, round) {
-						a := ps.executeAction(ctx, pers, planned, twState, round, sem)
-						if a != nil {
-							emit(*a)
+					tl := weightedTimeline(twState, pers.AgentID, influenceByID, 10, round)
+					for _, planned := range pers.DecideFromTimeline(tl, cfg.Scenario, round, "twitter") {
+						if !planned.NeedLLM {
+							if a := execNoLLM(pers, planned, twState, round); a != nil {
+								emit(*a)
+							}
+						} else {
+							roundBatchMu.Lock()
+							roundBatch = append(roundBatch, contentItem{pers, planned, twState})
+							roundBatchMu.Unlock()
 						}
 					}
 				}
 				if hasPlatform(cfg.Platforms, "reddit") {
-					rdWeightedTimeline := weightedTimeline(rdState, pers.AgentID+"_rd", influenceByID, 10, round)
-					for _, planned := range pers.DecideFromTimeline(rdWeightedTimeline, cfg.Scenario, round) {
-						a := ps.executeAction(ctx, pers, planned, rdState, round, sem)
-						if a != nil {
-							a.Platform = "reddit"
-							emit(*a)
+					tl := weightedTimeline(rdState, pers.AgentID+"_rd", influenceByID, 10, round)
+					for _, planned := range pers.DecideFromTimeline(tl, cfg.Scenario, round, "reddit") {
+						if !planned.NeedLLM {
+							if a := execNoLLM(pers, planned, rdState, round); a != nil {
+								a.Platform = "reddit"
+								emit(*a)
+							}
+						} else {
+							roundBatchMu.Lock()
+							roundBatch = append(roundBatch, contentItem{pers, planned, rdState})
+							roundBatchMu.Unlock()
 						}
 					}
 				}
@@ -350,12 +387,80 @@ func (ps *PlatformSim) Run(
 		}
 		wg.Wait()
 
+		// ── Phase 2: batch content generation ────────────────────────────
+		// Default: one LLM call per round for all content (batch JSON).
+		// NoLLM: pure templates, zero LLM calls.
+		if len(roundBatch) > 0 {
+			var contents []string
+			var batchErr error
+
+			if cfg.NoLLM {
+				contents = make([]string, len(roundBatch))
+				for i, it := range roundBatch {
+					contents[i] = genContentTemplate(it.pers, it.planned.Topic, it.planned.Type, it.state.Platform, round)
+				}
+			} else {
+				contents, batchErr = ps.batchGenContent(ctx, roundBatch, round)
+			}
+
+			// ── Phase 3: create posts + emit ─────────────────────────────
+			for i, it := range roundBatch {
+				if batchErr != nil {
+					emit(platform.Action{
+						Round: round, Timestamp: time.Now(),
+						Platform:  it.state.Platform,
+						AgentID:   it.pers.AgentID,
+						AgentName: it.pers.Name,
+						Type:      it.planned.Type,
+						Success:   false,
+						Error:     batchErr.Error(),
+					})
+					continue
+				}
+
+				content := ""
+				if i < len(contents) {
+					content = contents[i]
+				}
+				if content == "" {
+					content = genContentTemplate(it.pers, it.planned.Topic, it.planned.Type, it.state.Platform, round)
+				}
+
+				post := &platform.Post{
+					ID:         uuid.New().String(),
+					Platform:   it.state.Platform,
+					AuthorID:   it.pers.AgentID,
+					AuthorName: it.pers.Name,
+					Content:    content,
+					ParentID:   it.planned.PostID,
+					Timestamp:  time.Now(),
+					Tags:       platform.ExtractTags(content),
+				}
+				if it.state.Platform == "reddit" {
+					post.Subreddit = pickSub(it.pers.Interests)
+				}
+				it.state.AddPost(post)
+
+				emit(platform.Action{
+					Round:     round,
+					Timestamp: time.Now(),
+					Platform:  it.state.Platform,
+					AgentID:   it.pers.AgentID,
+					AgentName: it.pers.Name,
+					Type:      it.planned.Type,
+					PostID:    post.ID,
+					Content:   content,
+					Success:   true,
+				})
+			}
+		}
+
 		// ── Flush graph memory edges for this round ───────────────────────
 		if memUpdater != nil {
 			roundActionsMu.Lock()
-			batch := append([]platform.Action(nil), roundActions...)
+			memBatch := append([]platform.Action(nil), roundActions...)
 			roundActionsMu.Unlock()
-			if err := memUpdater.FlushActions(projectID, batch); err != nil {
+			if err := memUpdater.FlushActions(projectID, memBatch); err != nil {
 				if progressCh != nil {
 					progressCh <- RoundProgress{
 						Round:     round,
@@ -460,15 +565,15 @@ func weightedTimeline(state *platform.State, agentID string, influenceByID map[s
 
 // ─── Action Execution ─────────────────────────────────────────────────────────
 
-func (ps *PlatformSim) executeAction(
-	ctx context.Context,
-	p *platform.Personality,
-	planned platform.PlannedAction,
-	state *platform.State,
-	round int,
-	sem chan struct{},
-) *platform.Action {
+// contentItem is a pending content-generation request collected during the decide phase.
+type contentItem struct {
+	pers    *platform.Personality
+	planned platform.PlannedAction
+	state   *platform.State
+}
 
+// execNoLLM executes all non-content-generating actions.
+func execNoLLM(p *platform.Personality, planned platform.PlannedAction, state *platform.State, round int) *platform.Action {
 	a := &platform.Action{
 		Round:     round,
 		Timestamp: time.Now(),
@@ -477,55 +582,63 @@ func (ps *PlatformSim) executeAction(
 		AgentName: p.Name,
 		Type:      planned.Type,
 		PostID:    planned.PostID,
+		TargetID:  planned.TargetID,
+		Query:     planned.Query,
 		Success:   true,
 	}
-
 	switch planned.Type {
-	case "LIKE_POST":
+	case platform.ActLikePost:
 		if planned.PostID == "" {
 			return nil
 		}
 		state.LikePost(planned.PostID)
-
-	case "REPOST":
+	case platform.ActDislikePost:
+		if planned.PostID == "" {
+			return nil
+		}
+		state.DislikePost(planned.PostID)
+	case platform.ActLikeComment:
+		if planned.PostID == "" {
+			return nil
+		}
+		state.LikeComment(planned.PostID)
+	case platform.ActDislikeComment:
+		if planned.PostID == "" {
+			return nil
+		}
+		state.DislikeComment(planned.PostID)
+	case platform.ActRepost:
 		if planned.PostID == "" {
 			return nil
 		}
 		state.Repost(planned.PostID)
-
-	case "FOLLOW":
-		if planned.PostID == "" { // PostID = target user ID
+	case platform.ActFollow:
+		if planned.TargetID == "" {
 			return nil
 		}
-		state.Follow(p.AgentID, planned.PostID)
-
-	case "CREATE_POST", "COMMENT", "QUOTE_POST":
-		if !planned.NeedLLM {
+		state.Follow(p.AgentID, planned.TargetID)
+		a.TargetID = planned.TargetID
+	case platform.ActMute:
+		if planned.TargetID == "" {
 			return nil
 		}
-		sem <- struct{}{}
-		content, err := ps.genContent(ctx, p, planned.Topic, planned.Type, state.Platform, p.Stance, p.SentimentBias)
-		<-sem
-		if err != nil {
-			a.Success = false
-			return a
-		}
-		post := &platform.Post{
-			ID:         uuid.New().String(),
-			Platform:   state.Platform,
-			AuthorID:   p.AgentID,
-			AuthorName: p.Name,
-			Content:    content,
-			ParentID:   planned.PostID,
-			Timestamp:  time.Now(),
-			Tags:       platform.ExtractTags(content),
-		}
-		if state.Platform == "reddit" {
-			post.Subreddit = pickSub(p.Interests)
-		}
-		state.AddPost(post)
-		a.PostID = post.ID
-		a.Content = content
+		state.Mute(p.AgentID, planned.TargetID)
+		a.TargetID = planned.TargetID
+	case platform.ActSearchPosts:
+		// Execute search; results feed into agent's next round timeline
+		_ = state.SearchPosts(planned.Query, 5)
+		a.Query = planned.Query
+	case platform.ActSearchUser:
+		_ = state.SearchUsers(planned.Query, 3)
+		a.Query = planned.Query
+	case platform.ActTrend:
+		// Agent views trending — no state mutation
+	case platform.ActRefresh:
+		// Agent refreshes feed — no state mutation
+	case platform.ActDoNothing:
+		// Explicit no-op
+	default:
+		return nil
 	}
 	return a
 }
@@ -540,7 +653,7 @@ func (ps *PlatformSim) genContent(
 	sentimentBias float64,
 ) (string, error) {
 	style := "1-2 sentences"
-	if actionType == "CREATE_POST" && p.Verbosity > 0.6 {
+	if actionType == platform.ActCreatePost && p.Verbosity > 0.6 {
 		style = "2-3 sentences"
 	}
 
@@ -702,8 +815,92 @@ func clamp01(v float64) float64 {
 
 func truncScenario(s string) string {
 	runes := []rune(s)
-	if len(runes) <= 80 {
+	if len(runes) <= 2000 {
 		return s
 	}
-	return string(runes[:80]) + "…"
+	return string(runes[:2000]) + "…"
+}
+
+// ─── Low-token helpers ────────────────────────────────────────────────────────
+
+// buildPersonalitiesLow builds personalities from node defaults — no LLM calls.
+func (ps *PlatformSim) buildPersonalitiesLow(nodes []db.Node, simCfg *platform.SimConfig) []*platform.Personality {
+	results := make([]*platform.Personality, len(nodes))
+	for i, n := range nodes {
+		results[i] = platform.FromNode(n, i)
+	}
+	if simCfg != nil {
+		platform.ApplySimConfig(results, simCfg)
+	}
+	return results
+}
+
+// genContentTemplate generates post content using local templates — no LLM calls.
+// Results vary by stance, action type, and round for diversity.
+func genContentTemplate(p *platform.Personality, topic, actionType, plat string, round int) string {
+	rng := rand.New(rand.NewSource(int64(round)*1337 + platform.HashStr(p.AgentID+actionType)))
+	short := clip(topic, 60)
+
+	type tmpl struct{ supportive, opposing, observer, neutral string }
+
+	var pool []tmpl
+	switch actionType {
+	case platform.ActCreatePost:
+		pool = []tmpl{
+			{
+				supportive: "Thinking a lot about " + short + " lately — and I genuinely believe this matters.",
+				opposing:   "Hot take: the discourse around " + short + " is missing the real point entirely.",
+				observer:   "Interesting how " + short + " keeps coming up. Worth paying attention to.",
+				neutral:    "Just saw another piece on " + short + ". Lots to unpack here.",
+			},
+			{
+				supportive: "We need more conversations about " + short + ". This is important.",
+				opposing:   "I'll be honest — I'm skeptical about " + short + ". Not convinced yet.",
+				observer:   "Following the " + short + " discussion closely. Complex issue.",
+				neutral:    short + " is trending again. Here are my quick thoughts.",
+			},
+			{
+				supportive: short + " — this is exactly the kind of thing we should be pushing for.",
+				opposing:   "People are getting too worked up about " + short + ". Let's be realistic.",
+				observer:   "Watching the " + short + " debate unfold in real time. Fascinating.",
+				neutral:    "My take on " + short + ": it's nuanced and deserves more careful thought.",
+			},
+		}
+	case platform.ActCreateComment:
+		pool = []tmpl{
+			{
+				supportive: "Totally agree with this perspective on " + short + ".",
+				opposing:   "Respectfully disagree. " + short + " isn't as straightforward as implied.",
+				observer:   "This is a fair point about " + short + ". Both sides have merit.",
+				neutral:    "Interesting angle on " + short + ". I see where you're coming from.",
+			},
+			{
+				supportive: "Yes! This is exactly what I've been saying about " + short + ".",
+				opposing:   "I'd push back on this framing of " + short + " — it oversimplifies things.",
+				observer:   "Good thread. " + short + " is worth more nuanced discussion.",
+				neutral:    "Fair take. " + short + " is definitely something people feel strongly about.",
+			},
+		}
+	default: // QUOTE_POST
+		pool = []tmpl{
+			{
+				supportive: "Sharing this because " + short + " deserves wider attention.",
+				opposing:   "Quoting this to add some context — " + short + " is more complicated.",
+				observer:   "Worth reading for anyone following " + short + ".",
+				neutral:    "Relevant to the ongoing " + short + " conversation.",
+			},
+		}
+	}
+
+	t := pool[rng.Intn(len(pool))]
+	switch p.Stance {
+	case "supportive":
+		return t.supportive
+	case "opposing":
+		return t.opposing
+	case "observer":
+		return t.observer
+	default:
+		return t.neutral
+	}
 }

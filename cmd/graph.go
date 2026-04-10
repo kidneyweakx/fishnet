@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"os/exec"
 	"runtime"
+	"strings"
 
 	"github.com/spf13/cobra"
 
 	"fishnet/internal/db"
 	"fishnet/internal/graph"
 	"fishnet/internal/llm"
+	"fishnet/internal/task"
 	"fishnet/internal/viz"
 )
 
@@ -265,6 +267,79 @@ func printSearchResult(r graph.SearchResult) {
 	}
 }
 
+// ─── graph tasks ─────────────────────────────────────────────────────────────
+
+var graphTasksCmd = &cobra.Command{
+	Use:   "tasks",
+	Short: "List all graph-build tasks",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		mgr := task.NewManager(".")
+		tasks, err := mgr.List()
+		if err != nil {
+			return err
+		}
+		if len(tasks) == 0 {
+			fmt.Println("No graph build tasks found. Run: fishnet analyze")
+			return nil
+		}
+		fmt.Printf("%-26s %-14s %5s  %-10s  %s\n", "ID", "STATUS", "PCT", "NODES/EDGES", "DIR")
+		fmt.Println(strings.Repeat("-", 80))
+		for _, t := range tasks {
+			ne := fmt.Sprintf("%d/%d", t.NodesAdded, t.EdgesAdded)
+			dir := t.Dir
+			if len(dir) > 30 {
+				dir = "…" + dir[len(dir)-29:]
+			}
+			fmt.Printf("%-26s %-14s %4d%%  %-10s  %s\n",
+				t.ID, t.Status, t.Progress(), ne, dir)
+		}
+		return nil
+	},
+}
+
+// ─── graph task <id> ──────────────────────────────────────────────────────────
+
+var graphTaskCmd = &cobra.Command{
+	Use:   "task <id>",
+	Short: "Show status of a graph-build task",
+	Args:  cobra.ExactArgs(1),
+	RunE: func(cmd *cobra.Command, args []string) error {
+		mgr := task.NewManager(".")
+		t, err := mgr.Load(args[0])
+		if err != nil {
+			return err
+		}
+		statusColor := cyan
+		switch t.Status {
+		case "completed":
+			statusColor = green
+		case "failed", "interrupted":
+			statusColor = yellow
+		}
+		fmt.Printf("\n%s  %s\n", bold("Task:"), t.ID)
+		fmt.Printf("  Status:    %s\n", statusColor(t.Status))
+		fmt.Printf("  Progress:  %d%% (%d / %d chunks)\n", t.Progress(), t.ChunksDone, t.ChunksTotal)
+		fmt.Printf("  Nodes:     +%d\n", t.NodesAdded)
+		fmt.Printf("  Edges:     +%d\n", t.EdgesAdded)
+		fmt.Printf("  Errors:    %d\n", t.Errors)
+		fmt.Printf("  Dir:       %s\n", t.Dir)
+		if !t.StartedAt.IsZero() {
+			fmt.Printf("  Started:   %s\n", t.StartedAt.Format("2006-01-02 15:04:05"))
+		}
+		if !t.FinishedAt.IsZero() {
+			fmt.Printf("  Finished:  %s\n", t.FinishedAt.Format("2006-01-02 15:04:05"))
+		}
+		if t.ErrorMsg != "" {
+			fmt.Printf("  Error:     %s\n", red(t.ErrorMsg))
+		}
+		if t.Status == "interrupted" || t.Status == "failed" {
+			fmt.Printf("\n  Resume:    fishnet analyze --resume %s\n", t.ID)
+		}
+		fmt.Println()
+		return nil
+	},
+}
+
 func openBrowser(url string) {
 	var cmd string
 	var args []string
@@ -294,6 +369,7 @@ func init() {
 	graphSearchInsightCmd.Flags().String("query", "", "Search query")
 
 	graphSearchCmd.AddCommand(graphSearchQuickCmd, graphSearchPanoramaCmd, graphSearchInsightCmd)
-	graphCmd.AddCommand(graphStatsCmd, graphShowCmd, graphWebCmd, graphCommunityCmd, graphSearchCmd)
+	graphCmd.AddCommand(graphStatsCmd, graphShowCmd, graphWebCmd, graphCommunityCmd, graphSearchCmd,
+		graphTasksCmd, graphTaskCmd)
 	rootCmd.AddCommand(graphCmd)
 }

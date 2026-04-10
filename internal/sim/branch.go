@@ -167,7 +167,7 @@ func (ps *PlatformSim) branchSummary(
 	// Count sentiment from action types as a rough proxy
 	positiveCount := 0
 	for _, a := range actions {
-		if a.Type == "LIKE_POST" || a.Type == "REPOST" {
+		if a.Type == platform.ActLikePost || a.Type == platform.ActRepost || a.Type == platform.ActLikeComment {
 			positiveCount++
 		}
 	}

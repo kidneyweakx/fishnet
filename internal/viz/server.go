@@ -3,11 +3,13 @@ package viz
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"strings"
 
 	"fishnet/internal/db"
+	"fishnet/internal/platform"
 )
 
 // ─── Graph JSON format for D3 ─────────────────────────────────────────────────
@@ -18,6 +20,29 @@ type vizNode struct {
 	Type        string `json:"type"`
 	Summary     string `json:"summary"`
 	CommunityID int    `json:"community"`
+}
+
+type agentCard struct {
+	ID              string   `json:"id"`
+	Name            string   `json:"name"`
+	NodeType        string   `json:"node_type"`
+	Summary         string   `json:"summary"`
+	CommunityID     int      `json:"community_id"`
+	Stance          string   `json:"stance"`
+	ActivityLevel   float64  `json:"activity_level"`
+	SentimentBias   float64  `json:"sentiment_bias"`
+	InfluenceWeight float64  `json:"influence_weight"`
+	Reactivity      float64  `json:"reactivity"`
+	Originality     float64  `json:"originality"`
+	PostsPerHour    float64  `json:"posts_per_hour"`
+	CommentsPerHour float64  `json:"comments_per_hour"`
+	ActiveHours     []int    `json:"active_hours"`
+	Creativity      float64  `json:"creativity"`
+	Rationality     float64  `json:"rationality"`
+	Empathy         float64  `json:"empathy"`
+	Extraversion    float64  `json:"extraversion"`
+	Openness        float64  `json:"openness"`
+	Interests       []string `json:"interests"`
 }
 
 type vizEdge struct {
@@ -55,6 +80,48 @@ func Serve(database *db.DB, projectID string) (string, error) {
 			return
 		}
 		json.NewEncoder(w).Encode(g)
+	})
+	mux.HandleFunc("/api/agents", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		nodes, err := database.GetNodes(projectID)
+		if err != nil {
+			http.Error(w, err.Error(), 500)
+			return
+		}
+		agents := make([]agentCard, 0, len(nodes))
+		for i, n := range nodes {
+			p := platform.FromNode(n, i)
+			agents = append(agents, agentCard{
+				ID:              n.ID,
+				Name:            n.Name,
+				NodeType:        n.Type,
+				Summary:         n.Summary,
+				CommunityID:     n.CommunityID,
+				Stance:          p.Stance,
+				ActivityLevel:   p.ActivityLevel,
+				SentimentBias:   p.SentimentBias,
+				InfluenceWeight: p.InfluenceWeight,
+				Reactivity:      p.Reactivity,
+				Originality:     p.Originality,
+				PostsPerHour:    p.PostsPerHour,
+				CommentsPerHour: p.CommentsPerHour,
+				ActiveHours:     p.ActiveHours,
+				Creativity:      p.Creativity,
+				Rationality:     p.Rationality,
+				Empathy:         p.Empathy,
+				Extraversion:    p.Extraversion,
+				Openness:        p.Openness,
+				Interests:       p.Interests,
+			})
+		}
+		if err := json.NewEncoder(w).Encode(agents); err != nil {
+			log.Printf("viz: encode agents: %v", err)
+		}
+	})
+	mux.HandleFunc("/step2", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, step2Template)
 	})
 
 	srv := &http.Server{Handler: mux}

@@ -13,10 +13,10 @@ import (
 const (
 	colBg     = "#0f1117"
 	colPanel  = "#1a1d2e"
-	colBorder = "#2d3748"
+	colBorder = "#4a5568" // was #2d3748 — too dark, borders invisible
 	colText   = "#e2e8f0"
-	colDim    = "#4a5568"
-	colMuted  = "#718096"
+	colDim    = "#718096" // was #4a5568 — too dark, text invisible
+	colMuted  = "#a0aec0" // was #718096 — bumped for readability
 	colBlue   = "#63b3ed"
 	colGreen  = "#68d391"
 	colYellow = "#f6e05e"
@@ -99,11 +99,11 @@ var (
 			Padding(0, 2)
 
 	tabInactiveStyle = lipgloss.NewStyle().
-				Foreground(lipgloss.Color(colMuted)).
+				Foreground(lipgloss.Color(colDim)).
 				Padding(0, 2)
 
 	statusBarStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color(colDim)).
+			Foreground(lipgloss.Color(colMuted)).
 			BorderTop(true).
 			BorderStyle(lipgloss.NormalBorder()).
 			BorderForeground(lipgloss.Color(colBorder))
@@ -189,16 +189,34 @@ func actionIcon(typ string) string {
 	switch typ {
 	case "CREATE_POST":
 		return S.Green.Render("✎")
+	case "CREATE_COMMENT":
+		return S.Muted.Render("💬")
 	case "LIKE_POST":
 		return S.Red.Render("♥")
+	case "DISLIKE_POST":
+		return S.Red.Render("↓")
+	case "LIKE_COMMENT":
+		return S.Red.Render("⇡")
+	case "DISLIKE_COMMENT":
+		return S.Red.Render("⇣")
 	case "REPOST":
 		return S.Teal.Render("↺")
-	case "COMMENT":
-		return S.Muted.Render("💬")
 	case "QUOTE_POST":
 		return S.Purple.Render("❝")
 	case "FOLLOW":
 		return S.Blue.Render("+")
+	case "MUTE":
+		return S.Dim.Render("⊘")
+	case "SEARCH_POSTS":
+		return S.Blue.Render("🔍")
+	case "SEARCH_USER":
+		return S.Blue.Render("👤")
+	case "TREND":
+		return S.Teal.Render("📈")
+	case "REFRESH":
+		return S.Dim.Render("⟳")
+	case "DO_NOTHING":
+		return S.Dim.Render("·")
 	default:
 		return S.Dim.Render("·")
 	}
@@ -210,6 +228,18 @@ func clip(s string, n int) string {
 		return s
 	}
 	return string(runes[:n]) + "…"
+}
+
+// clipLines clips a multi-line string to at most maxLines newline-separated lines.
+func clipLines(s string, maxLines int) string {
+	if maxLines <= 0 {
+		return ""
+	}
+	lines := strings.Split(s, "\n")
+	if len(lines) <= maxLines {
+		return s
+	}
+	return strings.Join(lines[:maxLines], "\n")
 }
 
 // stanceStyle returns a colored string for agent stance.

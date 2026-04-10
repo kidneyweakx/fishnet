@@ -42,6 +42,7 @@ type Section struct {
 
 // Report is the full generated report.
 type Report struct {
+	ID        string // unique report ID (matches the .md/.jsonl files)
 	ProjectID string
 	SimID     string
 	Scenario  string
@@ -216,7 +217,7 @@ func (a *Agent) buildTools(ctx context.Context, projectID, simID string) []tool 
 		},
 		{
 			Name:        "interview_agents",
-			Description: "Ask a question to named graph agents (or the 3 most relevant ones if none specified) and collect their in-character responses with key quotes and a synthesis summary.",
+			Description: "Ask a question to named graph agents (or the most relevant ones selected by AI if none specified) and collect their in-character responses with key quotes and a synthesis summary.",
 			Execute: func(ctx context.Context, params map[string]interface{}) string {
 				topic := strParam(params, "topic")
 				if topic == "" {
@@ -287,9 +288,44 @@ func (a *Agent) buildTools(ctx context.Context, projectID, simID string) []tool 
 						Summary:  summary,
 					}
 				} else {
-					report, err = InterviewStructured(ctx, a.db, a.llm, projectID, topic, maxAgents)
-					if err != nil {
-						return fmt.Sprintf("interview_agents error: %v", err)
+					// Use LLM to select the most relevant agents for this topic
+					selected, selErr := a.selectAgentsLLM(ctx, projectID, topic, maxAgents)
+					if selErr != nil || len(selected) == 0 {
+						// Fallback to existing structured interview
+						report, err = InterviewStructured(ctx, a.db, a.llm, projectID, topic, maxAgents)
+						if err != nil {
+							return fmt.Sprintf("interview_agents error: %v", err)
+						}
+					} else {
+						rawResponses, batchErr := a.InterviewBatch(ctx, projectID, selected, topic)
+						if batchErr != nil {
+							return fmt.Sprintf("interview_agents: batch error: %v", batchErr)
+						}
+						results := make([]InterviewResult, 0, len(selected))
+						var allBuilder strings.Builder
+						for _, name := range selected {
+							resp := rawResponses[name]
+							quotes := extractKeyQuotes(ctx, a.llm, resp, topic)
+							results = append(results, InterviewResult{
+								AgentName: name,
+								Response:  resp,
+								KeyQuotes: quotes,
+							})
+							fmt.Fprintf(&allBuilder, "%s: %s\n\n", name, resp)
+						}
+						synthesisPrompt := fmt.Sprintf(
+							"Synthesize these agent perspectives on \"%s\" into a 2-3 sentence summary:\n\n%s",
+							topic, strings.TrimSpace(allBuilder.String()),
+						)
+						summary, _ := a.llm.System(ctx,
+							"You are a synthesis writer. Summarize multiple agent perspectives concisely.",
+							synthesisPrompt,
+						)
+						report = &InterviewReport{
+							Question: topic,
+							Results:  results,
+							Summary:  summary,
+						}
 					}
 				}
 
@@ -599,7 +635,7 @@ func (a *Agent) GenerateWithSim(
 	tools := a.buildTools(ctx, projectID, simID)
 
 	// ── Phase 3: Generate sections via ReAct ───────────────────────────────────
-	report := &Report{ProjectID: projectID, SimID: simID, Scenario: scenario}
+	report := &Report{ID: reportID, ProjectID: projectID, SimID: simID, Scenario: scenario}
 
 	for i, sec := range outline.Sections {
 		content, err := a.generateSectionWithTools(ctx, sec.Title, sec.Focus, scenario, projectID, simID, tools, logger)
@@ -820,6 +856,85 @@ func (a *Agent) InterviewBatch(
 }
 
 // ─── Structured Interview ─────────────────────────────────────────────────────
+
+// selectAgentsLLM uses LLM to pick the most relevant agent names for an interview topic.
+// Returns up to maxN agent names from the available nodes. Falls back to the first maxN
+// agents if the LLM call fails or returns no valid names.
+func (a *Agent) selectAgentsLLM(ctx context.Context, projectID string, topic string, maxN int) ([]string, error) {
+	nodes, err := a.db.GetNodes(projectID)
+	if err != nil {
+		return nil, err
+	}
+	if len(nodes) == 0 {
+		return nil, nil
+	}
+
+	// Build a compact node list for LLM context.
+	type nodeInfo struct {
+		Name    string `json:"name"`
+		Type    string `json:"type"`
+		Summary string `json:"summary"`
+	}
+	nodeList := make([]nodeInfo, 0, len(nodes))
+	for _, n := range nodes {
+		nodeList = append(nodeList, nodeInfo{
+			Name:    n.Name,
+			Type:    n.Type,
+			Summary: truncate(n.Summary, 100),
+		})
+	}
+	nodesJSON, _ := json.Marshal(nodeList)
+
+	type selectionResult struct {
+		Selected []string `json:"selected"`
+		Reason   string   `json:"reason"`
+	}
+
+	prompt := fmt.Sprintf(
+		"Interview topic: %q\n\nAgents:\n%s\n\nSelect the %d most relevant agents for this interview topic. Choose agents whose role, type, or expertise makes them likely to have meaningful perspectives on the topic.",
+		topic, string(nodesJSON), maxN,
+	)
+
+	var result selectionResult
+	err = a.llm.JSON(ctx,
+		fmt.Sprintf("You are an interview director. Select up to %d agents most relevant to the interview topic. Return JSON: {\"selected\": [\"AgentName1\", ...], \"reason\": \"brief explanation\"}", maxN),
+		prompt,
+		&result,
+	)
+	firstN := func() []string {
+		out := make([]string, 0, maxN)
+		for i, n := range nodes {
+			if i >= maxN {
+				break
+			}
+			out = append(out, n.Name)
+		}
+		return out
+	}
+
+	if err != nil || len(result.Selected) == 0 {
+		return firstN(), nil
+	}
+
+	// Validate returned names against actual node names (case-insensitive).
+	nodeByName := make(map[string]string, len(nodes))
+	for _, n := range nodes {
+		nodeByName[strings.ToLower(n.Name)] = n.Name
+	}
+	var valid []string
+	for _, name := range result.Selected {
+		if canonical, ok := nodeByName[strings.ToLower(name)]; ok {
+			valid = append(valid, canonical)
+		}
+		if len(valid) >= maxN {
+			break
+		}
+	}
+	if len(valid) == 0 {
+		return firstN(), nil
+	}
+	return valid, nil
+}
 
 // SelectAgents uses the LLM to choose the most relevant agent names from the
 // available pool given the question context. Returns up to maxN agent names.

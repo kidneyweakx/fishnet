@@ -333,7 +333,7 @@ func TestDecide_ReturnsDeterministicResults(t *testing.T) {
 	}
 }
 
-func TestDecide_MaxFourActionsPerRound(t *testing.T) {
+func TestDecide_MaxSixActionsPerRound(t *testing.T) {
 	node := db.Node{ID: "n1", Name: "Alice", Type: "Person"}
 	p := FromNode(node, 0)
 	p.ActivityLevel = 1.0
@@ -354,8 +354,8 @@ func TestDecide_MaxFourActionsPerRound(t *testing.T) {
 
 	for round := 1; round <= 30; round++ {
 		actions := p.Decide(state, "scenario", round)
-		if len(actions) > 4 {
-			t.Errorf("round %d: %d actions, want <= 4", round, len(actions))
+		if len(actions) > 6 {
+			t.Errorf("round %d: %d actions, want <= 6", round, len(actions))
 		}
 	}
 }
@@ -383,12 +383,12 @@ func TestDecide_ObserverHasFewerCreatePosts(t *testing.T) {
 	activePosts := 0
 	for round := 1; round <= 100; round++ {
 		for _, a := range pObserver.Decide(state, "test", round) {
-			if a.Type == "CREATE_POST" {
+			if a.Type == ActCreatePost {
 				observerPosts++
 			}
 		}
 		for _, a := range pActive.Decide(state, "test", round) {
-			if a.Type == "CREATE_POST" {
+			if a.Type == ActCreatePost {
 				activePosts++
 			}
 		}
@@ -400,26 +400,25 @@ func TestDecide_ObserverHasFewerCreatePosts(t *testing.T) {
 	}
 }
 
-func TestDecide_InactiveAgentReturnsNil(t *testing.T) {
+func TestDecide_InactiveAgentReturnsDoNothing(t *testing.T) {
 	node := db.Node{ID: "n1", Name: "Alice", Type: "Person"}
 	p := FromNode(node, 0)
 	p.ActivityLevel = 0.0 // Never active
 
 	state := NewState("twitter")
 
-	// With ActivityLevel=0, agent should almost never return actions
-	activeCount := 0
+	// With ActivityLevel=0, agent should almost always return DO_NOTHING
+	doNothingCount := 0
 	for round := 0; round <= 100; round++ {
 		actions := p.Decide(state, "test", round)
-		if len(actions) > 0 {
-			activeCount++
+		if len(actions) == 1 && actions[0].Type == ActDoNothing {
+			doNothingCount++
 		}
 	}
 
-	// At ActivityLevel=0, only active-hour check + 5% fallback can generate actions
-	// This should be very rare (< 10% of rounds)
-	if activeCount > 20 {
-		t.Errorf("inactive agent (ActivityLevel=0) was active in %d/101 rounds, expected < 20", activeCount)
+	// At ActivityLevel=0, agent should emit DO_NOTHING in most rounds
+	if doNothingCount < 80 {
+		t.Errorf("inactive agent (ActivityLevel=0) returned DO_NOTHING in %d/101 rounds, expected >= 80", doNothingCount)
 	}
 }
 
@@ -566,8 +565,8 @@ func TestDecideFromTimeline_Deterministic(t *testing.T) {
 		{ID: "p1", AuthorID: "other", Content: "some post"},
 	}
 
-	a1 := p.DecideFromTimeline(timeline, "test", 5)
-	a2 := p.DecideFromTimeline(timeline, "test", 5)
+	a1 := p.DecideFromTimeline(timeline, "test", 5, "twitter")
+	a2 := p.DecideFromTimeline(timeline, "test", 5, "twitter")
 
 	if len(a1) != len(a2) {
 		t.Errorf("DecideFromTimeline not deterministic: %d vs %d actions", len(a1), len(a2))

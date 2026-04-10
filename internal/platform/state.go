@@ -4,6 +4,7 @@ package platform
 
 import (
 	"encoding/json"
+	"fmt"
 	"math/rand"
 	"strings"
 	"sync"
@@ -22,9 +23,15 @@ type Post struct {
 	Subreddit string    `json:"subreddit,omitempty"` // reddit only
 	Timestamp time.Time `json:"timestamp"`
 	Likes     int       `json:"likes"`
+	Dislikes  int       `json:"dislikes"`  // reddit downvotes
 	Reposts   int       `json:"reposts"`
 	Comments  int       `json:"comments"`
 	Tags      []string  `json:"tags,omitempty"`
+
+	// CommentLikes / CommentDislikes track aggregate vote counts on comments
+	// that are children of this post (reddit-style).
+	CommentLikes    int `json:"comment_likes,omitempty"`
+	CommentDislikes int `json:"comment_dislikes,omitempty"`
 }
 
 type User struct {
@@ -37,6 +44,51 @@ type User struct {
 	Posts       []string `json:"posts"` // post IDs
 	Karma       int      `json:"karma"` // reddit
 	FollowerCnt int      `json:"follower_count"`
+	Muted       []string `json:"muted,omitempty"` // user IDs this user has muted
+}
+
+// Action type constants — mirrors OASIS action vocabulary.
+//
+// Shared (Twitter + Reddit):
+//
+//	CREATE_POST, LIKE_POST, REPOST, QUOTE_POST, FOLLOW, DO_NOTHING, TREND, REFRESH
+//
+// Reddit-only:
+//
+//	CREATE_COMMENT, DISLIKE_POST, LIKE_COMMENT, DISLIKE_COMMENT,
+//	SEARCH_POSTS, SEARCH_USER, MUTE
+const (
+	ActCreatePost     = "CREATE_POST"
+	ActCreateComment  = "CREATE_COMMENT"
+	ActLikePost       = "LIKE_POST"
+	ActDislikePost    = "DISLIKE_POST"
+	ActLikeComment    = "LIKE_COMMENT"
+	ActDislikeComment = "DISLIKE_COMMENT"
+	ActRepost         = "REPOST"
+	ActQuotePost      = "QUOTE_POST"
+	ActFollow         = "FOLLOW"
+	ActSearchPosts    = "SEARCH_POSTS"
+	ActSearchUser     = "SEARCH_USER"
+	ActTrend          = "TREND"
+	ActRefresh        = "REFRESH"
+	ActMute           = "MUTE"
+	ActDoNothing      = "DO_NOTHING"
+)
+
+// TwitterActions are the actions available on the Twitter platform.
+var TwitterActions = []string{
+	ActCreatePost, ActLikePost, ActRepost, ActQuotePost,
+	ActFollow, ActTrend, ActRefresh, ActDoNothing,
+}
+
+// RedditActions are the actions available on the Reddit platform.
+var RedditActions = []string{
+	ActCreatePost, ActCreateComment,
+	ActLikePost, ActDislikePost,
+	ActLikeComment, ActDislikeComment,
+	ActSearchPosts, ActSearchUser,
+	ActTrend, ActRefresh,
+	ActFollow, ActMute, ActDoNothing,
 }
 
 // Action is a single agent action event — written to actions.jsonl
@@ -46,11 +98,60 @@ type Action struct {
 	Platform   string    `json:"platform"`
 	AgentID    string    `json:"agent_id"`
 	AgentName  string    `json:"agent_name"`
-	Type       string    `json:"type"` // CREATE_POST|LIKE_POST|REPOST|QUOTE_POST|COMMENT|FOLLOW|SEARCH
+	Type       string    `json:"type"`
 	PostID     string    `json:"post_id,omitempty"`
+	TargetID   string    `json:"target_id,omitempty"`   // target user for FOLLOW/MUTE/SEARCH_USER
 	Content    string    `json:"content,omitempty"`
+	Query      string    `json:"query,omitempty"`        // search query for SEARCH_POSTS/SEARCH_USER
 	Subreddit  string    `json:"subreddit,omitempty"`
 	Success    bool      `json:"success"`
+	Error      string    `json:"error,omitempty"` // non-empty when Success==false
+}
+
+// Description returns a human-readable memory description for graph updates.
+func (a Action) Description() string {
+	switch a.Type {
+	case ActCreatePost:
+		return fmt.Sprintf("%s published a post about: %s", a.AgentName, clipStr(a.Content, 80))
+	case ActCreateComment:
+		return fmt.Sprintf("%s commented on post %s: %s", a.AgentName, a.PostID, clipStr(a.Content, 60))
+	case ActLikePost:
+		return fmt.Sprintf("%s liked post %s", a.AgentName, a.PostID)
+	case ActDislikePost:
+		return fmt.Sprintf("%s disliked post %s", a.AgentName, a.PostID)
+	case ActLikeComment:
+		return fmt.Sprintf("%s upvoted a comment on post %s", a.AgentName, a.PostID)
+	case ActDislikeComment:
+		return fmt.Sprintf("%s downvoted a comment on post %s", a.AgentName, a.PostID)
+	case ActRepost:
+		return fmt.Sprintf("%s reposted post %s", a.AgentName, a.PostID)
+	case ActQuotePost:
+		return fmt.Sprintf("%s quote-posted %s: %s", a.AgentName, a.PostID, clipStr(a.Content, 60))
+	case ActFollow:
+		return fmt.Sprintf("%s followed user %s", a.AgentName, a.TargetID)
+	case ActSearchPosts:
+		return fmt.Sprintf("%s searched for posts: %q", a.AgentName, a.Query)
+	case ActSearchUser:
+		return fmt.Sprintf("%s searched for user: %q", a.AgentName, a.Query)
+	case ActTrend:
+		return fmt.Sprintf("%s browsed trending topics", a.AgentName)
+	case ActRefresh:
+		return fmt.Sprintf("%s refreshed their feed", a.AgentName)
+	case ActMute:
+		return fmt.Sprintf("%s muted user %s", a.AgentName, a.TargetID)
+	case ActDoNothing:
+		return fmt.Sprintf("%s chose to do nothing this round", a.AgentName)
+	default:
+		return fmt.Sprintf("%s performed %s", a.AgentName, a.Type)
+	}
+}
+
+func clipStr(s string, n int) string {
+	runes := []rune(s)
+	if len(runes) <= n {
+		return s
+	}
+	return string(runes[:n]) + "…"
 }
 
 func (a Action) MarshalLine() []byte {
@@ -127,6 +228,84 @@ func (s *State) Repost(postID string) {
 		p.Reposts++
 	}
 	s.mu.Unlock()
+}
+
+// DislikePost increments the dislike/downvote counter (Reddit).
+func (s *State) DislikePost(postID string) {
+	s.mu.Lock()
+	if p, ok := s.Posts[postID]; ok {
+		p.Dislikes++
+	}
+	s.mu.Unlock()
+}
+
+// LikeComment increments the aggregate comment-likes on a post's comment tree.
+func (s *State) LikeComment(postID string) {
+	s.mu.Lock()
+	if p, ok := s.Posts[postID]; ok {
+		p.CommentLikes++
+	}
+	s.mu.Unlock()
+}
+
+// DislikeComment increments the aggregate comment-dislikes on a post's comment tree.
+func (s *State) DislikeComment(postID string) {
+	s.mu.Lock()
+	if p, ok := s.Posts[postID]; ok {
+		p.CommentDislikes++
+	}
+	s.mu.Unlock()
+}
+
+// Mute adds targetID to the muterID's muted list.
+func (s *State) Mute(muterID, targetID string) {
+	if muterID == targetID {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	u := s.Users[muterID]
+	if u == nil {
+		return
+	}
+	for _, id := range u.Muted {
+		if id == targetID {
+			return
+		}
+	}
+	u.Muted = append(u.Muted, targetID)
+}
+
+// SearchPosts returns posts matching a simple keyword query.
+func (s *State) SearchPosts(query string, limit int) []*Post {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	q := strings.ToLower(query)
+	var out []*Post
+	for i := len(s.postOrder) - 1; i >= 0 && len(out) < limit; i-- {
+		p := s.Posts[s.postOrder[i]]
+		if p != nil && strings.Contains(strings.ToLower(p.Content), q) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// SearchUsers returns users whose name contains query.
+func (s *State) SearchUsers(query string, limit int) []*User {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	q := strings.ToLower(query)
+	var out []*User
+	for _, u := range s.Users {
+		if len(out) >= limit {
+			break
+		}
+		if strings.Contains(strings.ToLower(u.Name), q) {
+			out = append(out, u)
+		}
+	}
+	return out
 }
 
 func (s *State) Follow(followerID, followeeID string) {

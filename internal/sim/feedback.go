@@ -1,8 +1,6 @@
 package sim
 
 import (
-	"fmt"
-
 	"fishnet/internal/db"
 	"fishnet/internal/platform"
 )
@@ -19,62 +17,83 @@ func NewGraphMemoryUpdater(database *db.DB) *GraphMemoryUpdater {
 }
 
 // ProcessAction converts a simulation action into a graph edge and upserts it.
-// Maps action types to relationship types:
-//
-//	CREATE_POST  → agent PUBLISHED content (edge: agentID → PUBLISHED → agentID self-loop, fact = clipped content)
-//	LIKE_POST    → agent ENDORSED content creator (edge: agentID → ENDORSED → postID)
-//	REPOST       → agent AMPLIFIED content creator (edge: agentID → AMPLIFIED → postID)
-//	FOLLOW       → agent FOLLOWS target agent (edge: agentID → FOLLOWS → postID which is target user ID)
-//	COMMENT      → agent RESPONDED_TO content creator (edge: agentID → RESPONDED_TO → postID)
-//	QUOTE_POST   → agent REFERENCED content creator (edge: agentID → REFERENCED → postID)
+// Uses the Action.Description() method for the fact text, and maps action types
+// to semantic relationship types in the knowledge graph.
 func (u *GraphMemoryUpdater) ProcessAction(projectID string, action platform.Action) error {
+	fact := action.Description()
+
 	switch action.Type {
-	case "CREATE_POST":
-		fact := clip(action.Content, 100)
-		if fact == "" {
-			fact = fmt.Sprintf("%s published content during simulation round %d", action.AgentName, action.Round)
-		}
+	case platform.ActCreatePost:
 		return u.db.UpsertEdge(projectID, action.AgentID, action.AgentID, "PUBLISHED", fact)
 
-	case "LIKE_POST":
+	case platform.ActCreateComment:
 		if action.PostID == "" {
 			return nil
 		}
-		fact := fmt.Sprintf("%s endorsed content (post %s) during simulation round %d",
-			action.AgentName, action.PostID, action.Round)
-		return u.db.UpsertEdge(projectID, action.AgentID, action.PostID, "ENDORSED", fact)
-
-	case "REPOST":
-		if action.PostID == "" {
-			return nil
-		}
-		fact := fmt.Sprintf("%s amplified content (post %s) during simulation round %d",
-			action.AgentName, action.PostID, action.Round)
-		return u.db.UpsertEdge(projectID, action.AgentID, action.PostID, "AMPLIFIED", fact)
-
-	case "FOLLOW":
-		if action.PostID == "" {
-			return nil
-		}
-		fact := fmt.Sprintf("%s followed %s during simulation round %d",
-			action.AgentName, action.PostID, action.Round)
-		return u.db.UpsertEdge(projectID, action.AgentID, action.PostID, "FOLLOWS", fact)
-
-	case "COMMENT":
-		if action.PostID == "" {
-			return nil
-		}
-		fact := fmt.Sprintf("%s responded to content (post %s) during simulation round %d",
-			action.AgentName, action.PostID, action.Round)
 		return u.db.UpsertEdge(projectID, action.AgentID, action.PostID, "RESPONDED_TO", fact)
 
-	case "QUOTE_POST":
+	case platform.ActLikePost:
 		if action.PostID == "" {
 			return nil
 		}
-		fact := fmt.Sprintf("%s referenced content (post %s) during simulation round %d",
-			action.AgentName, action.PostID, action.Round)
+		return u.db.UpsertEdge(projectID, action.AgentID, action.PostID, "ENDORSED", fact)
+
+	case platform.ActDislikePost:
+		if action.PostID == "" {
+			return nil
+		}
+		return u.db.UpsertEdge(projectID, action.AgentID, action.PostID, "OPPOSED", fact)
+
+	case platform.ActLikeComment:
+		if action.PostID == "" {
+			return nil
+		}
+		return u.db.UpsertEdge(projectID, action.AgentID, action.PostID, "ENDORSED_COMMENT", fact)
+
+	case platform.ActDislikeComment:
+		if action.PostID == "" {
+			return nil
+		}
+		return u.db.UpsertEdge(projectID, action.AgentID, action.PostID, "OPPOSED_COMMENT", fact)
+
+	case platform.ActRepost:
+		if action.PostID == "" {
+			return nil
+		}
+		return u.db.UpsertEdge(projectID, action.AgentID, action.PostID, "AMPLIFIED", fact)
+
+	case platform.ActQuotePost:
+		if action.PostID == "" {
+			return nil
+		}
 		return u.db.UpsertEdge(projectID, action.AgentID, action.PostID, "REFERENCED", fact)
+
+	case platform.ActFollow:
+		target := action.TargetID
+		if target == "" {
+			target = action.PostID // backwards compat
+		}
+		if target == "" {
+			return nil
+		}
+		return u.db.UpsertEdge(projectID, action.AgentID, target, "FOLLOWS", fact)
+
+	case platform.ActMute:
+		target := action.TargetID
+		if target == "" {
+			return nil
+		}
+		return u.db.UpsertEdge(projectID, action.AgentID, target, "MUTED", fact)
+
+	case platform.ActSearchPosts:
+		return u.db.UpsertEdge(projectID, action.AgentID, action.AgentID, "SEARCHED", fact)
+
+	case platform.ActSearchUser:
+		return u.db.UpsertEdge(projectID, action.AgentID, action.AgentID, "SEARCHED_USER", fact)
+
+	case platform.ActTrend, platform.ActRefresh, platform.ActDoNothing:
+		// Passive actions — no graph edge needed
+		return nil
 	}
 	return nil
 }

@@ -27,11 +27,22 @@ type Session struct {
 	Notes     string    `json:"notes"` // user notes
 
 	// Runtime state fields (mirrors MiroFish SimulationState / SimulationRunState)
-	Status     string    `json:"status"`      // created|running|paused|completed|failed
+	Status     string    `json:"status"`      // created|prepared|running|paused|completed|failed
 	StartedAt  time.Time `json:"started_at"`  // zero if not yet started
 	FinishedAt time.Time `json:"finished_at"` // zero if not yet finished
 	ErrorMsg   string    `json:"error_msg"`   // non-empty when Status == "failed"
 	Progress   int       `json:"progress"`    // 0-100 percent of rounds completed
+
+	// Prepare-phase fields: set after `sim prepare` completes.
+	PreparedAt  time.Time `json:"prepared_at"`  // zero if not yet prepared
+	PersonaCount int      `json:"persona_count"` // number of agent profiles built
+}
+
+// MarkPrepared transitions the session to the "prepared" state.
+func (s *Session) MarkPrepared(personaCount int) {
+	s.Status = "prepared"
+	s.PreparedAt = time.Now()
+	s.PersonaCount = personaCount
 }
 
 // MarkRunning transitions the session to the "running" state.

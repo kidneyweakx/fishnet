@@ -383,7 +383,7 @@ func (c *Client) doCodexOAuth(ctx context.Context, msgs []Message) (string, erro
 	// Build request body
 	model := c.cfg.Model
 	if model == "" {
-		model = "gpt-4o"
+		model = "gpt-4o-mini"
 	}
 
 	type inputMsg struct {
@@ -408,6 +408,7 @@ func (c *Client) doCodexOAuth(ctx context.Context, msgs []Message) (string, erro
 	bodyMap := map[string]interface{}{
 		"model":        model,
 		"stream":       true,
+		"store":        false,
 		"input":        input,
 		"instructions": instructions,
 	}

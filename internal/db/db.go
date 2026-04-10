@@ -635,3 +635,50 @@ func (d *DB) GetSimsByProject(projectID string, limit int) ([]SimRecord, error) 
 	}
 	return out, rows.Err()
 }
+
+// ─── Danger Zone ─────────────────────────────────────────────────────────────
+
+// ClearGraph deletes all nodes, edges, and communities for a project.
+func (d *DB) ClearGraph(projectID string) error {
+	_, err := d.Exec(`DELETE FROM edges WHERE project_id = ?`, projectID)
+	if err != nil {
+		return err
+	}
+	_, err = d.Exec(`DELETE FROM nodes WHERE project_id = ?`, projectID)
+	if err != nil {
+		return err
+	}
+	_, err = d.Exec(`DELETE FROM communities WHERE project_id = ?`, projectID)
+	return err
+}
+
+// ClearSimData deletes all simulation posts and actions for a project.
+func (d *DB) ClearSimData(projectID string) error {
+	simRows, err := d.Query(`SELECT id FROM simulations WHERE project_id = ?`, projectID)
+	if err != nil {
+		return err
+	}
+	var ids []string
+	for simRows.Next() {
+		var id string
+		simRows.Scan(&id)
+		ids = append(ids, id)
+	}
+	simRows.Close()
+	for _, id := range ids {
+		d.Exec(`DELETE FROM sim_posts WHERE sim_id = ?`, id)
+		d.Exec(`DELETE FROM sim_actions WHERE sim_id = ?`, id)
+	}
+	_, err = d.Exec(`DELETE FROM simulations WHERE project_id = ?`, projectID)
+	return err
+}
+
+// ClearDocuments deletes all documents and chunks for a project.
+func (d *DB) ClearDocuments(projectID string) error {
+	_, err := d.Exec(`DELETE FROM chunks WHERE project_id = ?`, projectID)
+	if err != nil {
+		return err
+	}
+	_, err = d.Exec(`DELETE FROM documents WHERE project_id = ?`, projectID)
+	return err
+}

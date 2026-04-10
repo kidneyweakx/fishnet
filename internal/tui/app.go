@@ -44,6 +44,7 @@ const (
 	screenSession screen = 7  // Session manager
 	screenQuery   screen = 8  // Query / history browser
 	screenDebug   screen = 9  // Debug info overlay
+	screenDanger  screen = 10 // Danger zone: destructive operations
 )
 
 var tabLabels = []string{
@@ -179,6 +180,8 @@ type App struct {
 
 	// Step 1: Graph build
 	analyzeDir     string
+	analyzeDirInput textinput.Model
+	analyzeDirEdit  bool // true while editing the source dir
 	analyzeRunning bool
 	analyzeProg    analyzeProgressMsg
 	graphNodes     []db.Node
@@ -198,6 +201,7 @@ type App struct {
 	simRunning    bool
 	simDone       bool
 	simBackground bool // run without blocking navigation
+	simNoLLM   bool // template-only mode: zero LLM calls
 	simRound      int
 	simMaxRounds  int
 	simActions    []platform.Action // rolling last 80
@@ -264,6 +268,11 @@ type App struct {
 
 	// Expand-agents in-progress
 	expandRunning bool
+
+	// Danger zone
+	dangerIdx     int    // selected action in danger zone list
+	dangerConfirm bool   // waiting for y/n confirmation
+	dangerMsg     string // last result message
 }
 
 // ─── Run ─────────────────────────────────────────────────────────────────────
@@ -303,6 +312,17 @@ func newApp(cfg *config.Config, database *db.DB, projectID string) App {
 	wd.CharLimit = 200
 	wd.Width = 40
 
+	// Source dir inline editor (graph screen)
+	di := textinput.New()
+	di.Placeholder = "./docs"
+	di.CharLimit = 200
+	di.Width = 50
+
+	// Load persisted dir
+	savedDir := loadAnalyzeDir()
+	di.SetValue(savedDir)
+	wd.SetValue(savedDir) // pre-fill wizard too
+
 	startScreen := screenDash
 	if projectID == "" {
 		startScreen = screenWizard
@@ -310,22 +330,23 @@ func newApp(cfg *config.Config, database *db.DB, projectID string) App {
 	}
 
 	m := App{
-		cfg:          cfg,
-		db:           database,
-		projectID:    projectID,
-		screen:       startScreen,
-		spinner:      sp,
-		viewport:     vp,
-		simInput:     si,
-		chatInput:    ci,
-		simRounds:    10,
-		simMaxAgents: 25,
-		simPlatforms: []string{"twitter", "reddit"},
-		analyzeDir:   ".",
-		maxLogs:      80,
-		panelFocus:   focusLeft,
-		wizardName:   wn,
-		wizardDir:    wd,
+		cfg:             cfg,
+		db:              database,
+		projectID:       projectID,
+		screen:          startScreen,
+		spinner:         sp,
+		viewport:        vp,
+		simInput:        si,
+		chatInput:       ci,
+		simRounds:       10,
+		simMaxAgents:    25,
+		simPlatforms:    []string{"twitter", "reddit"},
+		analyzeDir:      savedDir,
+		analyzeDirInput: di,
+		maxLogs:         80,
+		panelFocus:      focusLeft,
+		wizardName:      wn,
+		wizardDir:       wd,
 	}
 
 	if projectID != "" {
@@ -362,6 +383,15 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.viewport.Height = m.height - 8
 
 	case tea.KeyMsg:
+		// Update dir input when in edit mode (before handleKey so value is current).
+		if m.screen == screenGraph && m.analyzeDirEdit {
+			var tiCmd tea.Cmd
+			m.analyzeDirInput, tiCmd = m.analyzeDirInput.Update(msg)
+			if tiCmd != nil {
+				cmds = append(cmds, tiCmd)
+			}
+		}
+
 		// For the wizard screen, update the active text input BEFORE handleKey
 		// so that handleWizardKey reads up-to-date values (e.g. when Enter is pressed).
 		wizardInputHandled := false
@@ -450,6 +480,10 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		// Surface LLM errors from failed actions into the log panel
+		for _, logLine := range prog.Logs {
+			m.addLog(logLine)
+		}
 
 	case simDoneMsg:
 		m.simRunning = false
@@ -508,7 +542,13 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.addLog("✗ Wizard: " + msg.err.Error())
 		} else {
 			m.projectID = msg.projectID
-			m.analyzeDir = "."
+			wizDir := strings.TrimSpace(m.wizardDir.Value())
+			if wizDir == "" {
+				wizDir = "."
+			}
+			m.analyzeDir = wizDir
+			m.analyzeDirInput.SetValue(wizDir)
+			saveAnalyzeDir(wizDir)
 			nodes, _ := m.db.GetNodes(msg.projectID)
 			edges, _ := m.db.GetEdges(msg.projectID)
 			m.graphNodes = nodes
@@ -569,6 +609,16 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if nodes, err := m.db.GetNodes(m.projectID); err == nil {
 				m.graphNodes = nodes
 			}
+		}
+
+	case dangerDoneMsg:
+		m.dangerMsg = msg.msg
+		// Refresh graph/entity data after destructive ops
+		if nodes, err := m.db.GetNodes(m.projectID); err == nil {
+			m.graphNodes = nodes
+		}
+		if edges, err := m.db.GetEdges(m.projectID); err == nil {
+			m.graphEdges = edges
 		}
 	}
 
@@ -696,6 +746,28 @@ func (m *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		return m.handleWizardKey(msg)
 	}
 
+	// Dir edit mode on graph screen intercepts keys.
+	if m.screen == screenGraph && m.analyzeDirEdit {
+		switch msg.String() {
+		case "ctrl+c":
+			return tea.Quit
+		case "esc":
+			m.analyzeDirEdit = false
+			m.analyzeDirInput.Blur()
+			m.analyzeDirInput.SetValue(m.analyzeDir) // revert
+		case "enter":
+			dir := strings.TrimSpace(m.analyzeDirInput.Value())
+			if dir == "" {
+				dir = "."
+			}
+			m.analyzeDir = dir
+			m.analyzeDirEdit = false
+			m.analyzeDirInput.Blur()
+			saveAnalyzeDir(dir)
+		}
+		return nil
+	}
+
 	// When a text input is focused, bypass all global navigation keys.
 	// Only ctrl+c (quit) and esc (blur) are intercepted; enter falls through
 	// to the screen-specific handler; everything else goes to textinput.Update().
@@ -766,6 +838,12 @@ func (m *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.simInput.Blur()
 			m.chatInput.Blur()
 			return m.loadSessions()
+		case "X":
+			m.screen = screenDanger
+			m.dangerIdx = 0
+			m.dangerConfirm = false
+			m.dangerMsg = ""
+			return nil
 		case "esc":
 			if m.entitySearchMode {
 				m.entitySearchMode = false
@@ -838,11 +916,45 @@ func (m *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 			m.screen = m.prevScreen
 		}
 
+	case screenDanger:
+		if m.dangerConfirm {
+			switch msg.String() {
+			case "y", "Y":
+				return m.execDangerAction()
+			case "n", "N", "esc":
+				m.dangerConfirm = false
+				m.dangerMsg = ""
+			}
+		} else {
+			switch msg.String() {
+			case "esc", "q":
+				m.screen = screenDash
+			case "up", "k":
+				if m.dangerIdx > 0 {
+					m.dangerIdx--
+				}
+			case "down", "j":
+				if m.dangerIdx < 2 {
+					m.dangerIdx++
+				}
+			case "enter":
+				m.dangerConfirm = true
+				m.dangerMsg = ""
+			}
+		}
+
 	case screenGraph:
 		switch msg.String() {
 		case "a", "enter":
-			if !m.analyzeRunning {
+			if !m.analyzeRunning && !m.analyzeDirEdit {
 				return m.startAnalyze()
+			}
+		case "d":
+			if !m.analyzeRunning {
+				m.analyzeDirEdit = true
+				m.analyzeDirInput.SetValue(m.analyzeDir)
+				m.analyzeDirInput.Focus()
+				m.analyzeDirInput.CursorEnd()
 			}
 		case "w":
 			return m.openWebViz()
@@ -936,6 +1048,10 @@ func (m *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 		case "R":
 			if m.simRounds > 1 {
 				m.simRounds--
+			}
+		case "l", "L":
+			if !m.simRunning {
+				m.simNoLLM = !m.simNoLLM
 			}
 		}
 
@@ -1186,10 +1302,16 @@ func (m App) viewProviderPicker() string {
 	return strings.Join(out, "\n")
 }
 
+const minWidth = 90
+const minHeight = 26
+
 func (m App) View() string {
 	if m.width == 0 {
 		return "Initializing…"
 	}
+
+	// ── Responsive guard (non-blocking: injects warning into status bar) ─────
+	tooSmall := m.width < minWidth || m.height < minHeight
 
 	if m.providerPickerActive {
 		return m.viewProviderPicker()
@@ -1205,6 +1327,13 @@ func (m App) View() string {
 
 	if m.screen == screenDebug {
 		return m.viewDebug()
+	}
+
+	if m.screen == screenDanger {
+		header := m.renderHeader()
+		tabs := m.renderTabs()
+		status := m.renderStatus()
+		return lipgloss.JoinVertical(lipgloss.Left, header, tabs, m.viewDanger(), status)
 	}
 
 	if m.screen == screenHelp {
@@ -1237,7 +1366,41 @@ func (m App) View() string {
 	}
 
 	status := m.renderStatus()
+	if tooSmall {
+		sizeWarn := S.Red.Render(fmt.Sprintf("⚠ terminal %d×%d (need %d×%d)", m.width, m.height, minWidth, minHeight))
+		status = statusBarStyle.Width(m.width).Render("  " + sizeWarn)
+	}
+
+	// Hard-clamp: ensure body never pushes header/status off-screen.
+	// header=2 lines + tabs=1 + status=2 = 5 reserved lines.
+	maxBodyLines := m.height - 5
+	if maxBodyLines < 1 {
+		maxBodyLines = 1
+	}
+	if bodyLines := strings.Split(body, "\n"); len(bodyLines) > maxBodyLines {
+		body = strings.Join(bodyLines[:maxBodyLines], "\n")
+	}
+
 	return lipgloss.JoinVertical(lipgloss.Left, header, tabs, body, status)
+}
+
+// ─── Layout helpers ──────────────────────────────────────────────────────────
+
+// availPanelH returns the exact inner height available for split-panel bodies.
+// It measures actual rendered heights so the result is always accurate regardless
+// of border/padding changes.
+//   bodyPrefixLines = number of text lines consumed by the body before the panel
+//                    (typically 3: blank + heading + blank)
+func (m App) availPanelH(bodyPrefixLines int) int {
+	headerH := lipgloss.Height(m.renderHeader())
+	tabsH := lipgloss.Height(m.renderTabs())
+	statusH := lipgloss.Height(m.renderStatus())
+	// panel borders add 2 lines (top + bottom rounded border)
+	h := m.height - headerH - tabsH - statusH - bodyPrefixLines - 2
+	if h < 4 {
+		h = 4
+	}
+	return h
 }
 
 // ─── Header / Tabs / Status ──────────────────────────────────────────────────
@@ -1266,13 +1429,26 @@ func (m App) renderHeader() string {
 		}
 	}
 
-	left := S.Bold.Render("fishnet") + "  ·  " + project + "  ·  " + model + simIndicator + llmIndicator
-
 	// Right side: current time + hint
 	now := time.Now().Format("15:04")
 	right := S.Dim.Render("[q]quit  [esc]home  [?]help  " + now)
+	rightW := lipgloss.Width(right)
 
-	gap := w - lipgloss.Width(left) - lipgloss.Width(right)
+	// Build left side, dropping optional indicators progressively if too wide.
+	// Ensures header content never exceeds terminal width (prevents line wrapping
+	// which causes lipgloss.Height to undercount and pushes the header off-screen).
+	left := S.Bold.Render("fishnet") + "  ·  " + project + "  ·  " + model + simIndicator + llmIndicator
+	if lipgloss.Width(left)+rightW > w {
+		left = S.Bold.Render("fishnet") + "  ·  " + project + "  ·  " + model + simIndicator
+	}
+	if lipgloss.Width(left)+rightW > w {
+		left = S.Bold.Render("fishnet") + "  ·  " + project + "  ·  " + model
+	}
+	if lipgloss.Width(left)+rightW > w {
+		left = S.Bold.Render("fishnet") + "  ·  " + project
+	}
+
+	gap := w - lipgloss.Width(left) - rightW
 	if gap < 0 {
 		gap = 0
 	}
@@ -1316,9 +1492,13 @@ func (m App) renderStatus() string {
 
 	switch m.screen {
 	case screenDash:
-		hint = "[1-5] switch tabs  [q] quit  [?] help"
+		hint = "[1-5] switch tabs  [X] danger zone  [q] quit  [?] help"
 	case screenGraph:
-		hint = "[a] analyze docs  [c] community detection  [w] web viz  [esc] home"
+		if m.analyzeDirEdit {
+			hint = "[enter] confirm dir  [esc] cancel"
+		} else {
+			hint = "[a] analyze docs  [d] change dir  [c] community detection  [w] web viz  [esc] home"
+		}
 	case screenEnv:
 		if m.entitySearchMode {
 			hint = "[esc] cancel search  [enter] confirm"
@@ -1345,8 +1525,14 @@ func (m App) renderStatus() string {
 		hint = "[tab] switch view  [↑↓] scroll  [r] refresh  [esc] home"
 	case screenHelp:
 		hint = "[esc/q] close help"
+	case screenDanger:
+		if m.dangerConfirm {
+			hint = S.Red.Render("[y] confirm  [n/esc] cancel")
+		} else {
+			hint = "[↑↓/jk] navigate  [enter] select  [esc] home"
+		}
 	}
-	return statusBarStyle.Width(m.width).Render("  " + S.Dim.Render(hint))
+	return statusBarStyle.Width(m.width).Render("  " + hint)
 }
 
 // ─── Screen Views ─────────────────────────────────────────────────────────────
@@ -1511,6 +1697,14 @@ func (m App) viewGraph() string {
 	var card02 string
 	{
 		var body string
+		// Source dir line — shows inline editor when [d] pressed
+		var sourceDirLine string
+		if m.analyzeDirEdit {
+			sourceDirLine = "  Source dir: " + m.analyzeDirInput.View() + S.Dim.Render("  [enter] confirm  [esc] cancel")
+		} else {
+			sourceDirLine = "  Source dir: " + S.Blue.Render(m.analyzeDir) + S.Dim.Render("  [d] change")
+		}
+
 		if graphRunning {
 			pct := 0
 			if m.analyzeProg.total > 0 {
@@ -1520,12 +1714,12 @@ func (m App) viewGraph() string {
 			body = S.Yellow.Render(fmt.Sprintf("[RUNNING %d%%]", pct)) + " " + bar + "\n" +
 				fmt.Sprintf("  %s Extracting… +%d nodes  +%d edges",
 					m.spinner.View(), m.analyzeProg.nodes, m.analyzeProg.edges) + "\n" +
-				"  Source dir: " + S.Blue.Render(m.analyzeDir)
+				sourceDirLine
 			card02 = boxStyleTeal.Width(cardW).Render(
 				S.Bold.Render("02 GraphRAG Build") + "\n" + body)
 		} else if m.analyzeProg.err != nil {
 			body = S.Red.Render("✗ "+m.analyzeProg.err.Error()) + "\n" +
-				"  Source dir: " + S.Blue.Render(m.analyzeDir)
+				sourceDirLine
 			card02 = boxStyle.Width(cardW).Render(
 				S.Bold.Render("02 GraphRAG Build") + "\n" + body)
 		} else if graphDone {
@@ -1534,12 +1728,12 @@ func (m App) viewGraph() string {
 				extraWarn = "\n  " + S.Yellow.Render("⚠ No nodes extracted — check provider config ([D] for details)")
 			}
 			body = S.Green.Render("[COMPLETED] ✓") + fmt.Sprintf("  %d nodes, %d edges", st.Nodes, st.Edges) + "\n" +
-				"  Source dir: " + S.Blue.Render(m.analyzeDir) + extraWarn
+				sourceDirLine + extraWarn
 			card02 = boxStyleGreen.Width(cardW).Render(
 				S.Bold.Render("02 GraphRAG Build") + "\n" + body)
 		} else {
 			body = S.Dim.Render("[PENDING]  Press [a] to start") + "\n" +
-				"  Source dir: " + S.Blue.Render(m.analyzeDir)
+				sourceDirLine
 			card02 = boxStyle.Width(cardW).Render(
 				S.Bold.Render("02 GraphRAG Build") + "\n" + body)
 		}
@@ -1606,7 +1800,7 @@ func (m App) viewEntities() string {
 	rightW := w - leftW - 3
 
 	// ── Left panel: agent list ──────────────────────────────────────────────
-	panelH := m.height - 8
+	panelH := m.availPanelH(3) // 3 pre-panel lines: blank + heading + blank
 	listH := panelH - 5 // reserve lines for hintLine + title inside panel
 	if listH < 3 {
 		listH = 3
@@ -1665,7 +1859,7 @@ func (m App) viewEntities() string {
 	var rightContent string
 	if m.entityIdx < len(nodes) {
 		n := nodes[m.entityIdx]
-		rightContent = m.renderEntityDetail(n, rightW)
+		rightContent = clipLines(m.renderEntityDetail(n, rightW), panelH-1)
 	} else {
 		rightContent = S.Dim.Render("  Select an agent to view details.")
 	}
@@ -1887,16 +2081,24 @@ func (m App) viewSim() string {
 		agentCount = len(m.graphNodes)
 	}
 
+	modeStr := S.Green.Render("● Batch") + S.Dim.Render("  (1 LLM call/round, fastest with quality)")
+	if m.simNoLLM {
+		modeStr = S.Yellow.Render("◐ No-LLM") + S.Dim.Render("  (templates only, zero token cost)")
+	}
+
 	cfgBlock := "  " + S.Bold.Render("Settings") + "\n" +
 		fmt.Sprintf("    %s  %s\n",
 			S.Muted.Render("Rounds:   "), S.Bold.Render(fmt.Sprint(m.simRounds))+S.Dim.Render("  (press r/R to adjust)")) +
 		fmt.Sprintf("    %s  %s\n",
 			S.Muted.Render("Agents:   "), S.Bold.Render(fmt.Sprint(agentCount))+S.Dim.Render(" (all from graph)")) +
+		fmt.Sprintf("    %s  %s\n",
+			S.Muted.Render("Platforms:"), platforms) +
 		fmt.Sprintf("    %s  %s",
-			S.Muted.Render("Platforms:"), platforms)
+			S.Muted.Render("Mode:     "), modeStr)
 
 	actions := "\n  " + S.Green.Render("[enter]") + S.Dim.Render(" Start simulation    ") +
-		S.Yellow.Render("[b]") + S.Dim.Render(" Run in background") + bgFlag
+		S.Yellow.Render("[b]") + S.Dim.Render(" Run in background") + bgFlag + "    " +
+		S.Blue.Render("[l]") + S.Dim.Render(" Toggle mode")
 
 	return "\n  " + heading + "\n\n" +
 		scenarioBox + "\n\n" +
@@ -1957,7 +2159,13 @@ func (m App) viewSimRunning() string {
 		icon := actionIcon(a.Type)
 		var excerpt string
 		if !a.Success {
-			excerpt = S.Red.Render("✗ failed")
+			errHint := a.Error
+			if errHint == "" {
+				errHint = "failed"
+			} else if len(errHint) > contentW {
+				errHint = errHint[:contentW-1] + "…"
+			}
+			excerpt = S.Red.Render("✗ " + errHint)
 		} else if a.Content != "" {
 			excerpt = S.Muted.Render(`"` + clip(a.Content, contentW) + `"`)
 		} else {
@@ -2048,7 +2256,7 @@ func (m App) viewReport() string {
 		return "\n  " + heading + hint
 	}
 
-	panelH := m.height - 8
+	panelH := m.availPanelH(3) // 3 pre-panel lines: blank + heading + blank
 	leftW := (w * 30) / 100
 	rightW := w - leftW - 3
 
@@ -2102,7 +2310,7 @@ func (m App) viewReport() string {
 	sectionLines = append(sectionLines, S.Dim.Render(" [r] Generate"))
 	sectionLines = append(sectionLines, S.Dim.Render(" [s] Save MD"))
 
-	leftContent := strings.Join(sectionLines, "\n")
+	leftContent := clipLines(strings.Join(sectionLines, "\n"), panelH-1)
 	var leftPanel string
 	if m.panelFocus == focusLeft {
 		leftPanel = leftPanelActiveStyle.Width(leftW).Height(panelH).Render(
@@ -2138,10 +2346,10 @@ func (m App) viewReport() string {
 	var rightPanel string
 	if m.panelFocus == focusRight {
 		rightPanel = rightPanelActiveStyle.Width(rightW).Height(panelH).Render(
-			S.Blue.Render(rightTitle) + "\n" + rightInner)
+			S.Blue.Render(rightTitle) + "\n" + clipLines(rightInner, panelH-1))
 	} else {
 		rightPanel = rightPanelStyle.Width(rightW).Height(panelH).Render(
-			S.Muted.Render(rightTitle) + "\n" + rightInner)
+			S.Muted.Render(rightTitle) + "\n" + clipLines(rightInner, panelH-1))
 	}
 
 	splitRow := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel)
@@ -2152,7 +2360,7 @@ func (m App) viewChat() string {
 	w := m.width - 4
 	heading := S.Bold.Render("Step 5 — Agent Interview")
 
-	panelH := m.height - 8
+	panelH := m.availPanelH(3) // 3 pre-panel lines: blank + heading + blank
 	leftW := (w * 30) / 100
 	rightW := w - leftW - 3
 
@@ -2259,10 +2467,10 @@ func (m App) viewChat() string {
 	var rightPanel string
 	if m.panelFocus == focusRight {
 		rightPanel = rightPanelActiveStyle.Width(rightW).Height(panelH).Render(
-			S.Blue.Render(chatTitle) + "\n" + rightContent)
+			S.Blue.Render(chatTitle) + "\n" + clipLines(rightContent, panelH-1))
 	} else {
 		rightPanel = rightPanelStyle.Width(rightW).Height(panelH).Render(
-			S.Muted.Render(chatTitle) + "\n" + rightContent)
+			S.Muted.Render(chatTitle) + "\n" + clipLines(rightContent, panelH-1))
 	}
 
 	splitRow := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel)
@@ -2437,10 +2645,7 @@ func (m App) viewSession() string {
 	w := m.width - 4
 	heading := S.Bold.Render("Sessions")
 
-	panelH := m.height - 8
-	if panelH < 4 {
-		panelH = 4
-	}
+	panelH := m.availPanelH(3) // 3 pre-panel lines: blank + heading + blank
 	leftW := (w * 40) / 100
 	rightW := w - leftW - 3
 
@@ -2512,7 +2717,7 @@ func (m App) viewSession() string {
 	}
 
 	rightPanel := rightPanelStyle.Width(rightW).Height(panelH).Render(
-		S.Muted.Render("Detail") + "\n" + rightContent)
+		S.Muted.Render("Detail") + "\n" + clipLines(rightContent, panelH-1))
 
 	splitRow := lipgloss.JoinHorizontal(lipgloss.Top, leftPanel, " ", rightPanel)
 	return "\n  " + heading + "\n\n  " + splitRow
@@ -2535,10 +2740,8 @@ func (m App) viewQuery() string {
 	}
 	tabBar := lipgloss.JoinHorizontal(lipgloss.Top, tabParts...)
 
-	panelH := m.height - 10
-	if panelH < 5 {
-		panelH = 5
-	}
+	// 5 pre-panel lines: blank + heading + blank + tabBar + blank
+	panelH := m.availPanelH(5)
 
 	var displayLines []string
 	if len(m.queryLines) == 0 {
@@ -2998,6 +3201,7 @@ func (m *App) loadQueryData() tea.Cmd {
 
 func (m *App) startAnalyze() tea.Cmd {
 	m.analyzeRunning = true
+	saveAnalyzeDir(m.analyzeDir)
 	m.addLog("→ Analyzing " + m.analyzeDir + "…")
 
 	cfg := m.cfg
@@ -3113,15 +3317,17 @@ func (m *App) startSim() tea.Cmd {
 	}
 	cfg.LLM.APIKey = apiKey
 
+	lowToken := m.simNoLLM
 	go func() {
 		client := llm.New(cfg.LLM)
 		ps := sim.NewPlatformSim(database, client)
 		err := ps.Run(context.Background(), projectID, sim.RoundConfig{
-			Scenario:  scenario,
-			MaxRounds: rounds,
-			MaxAgents: agents,
-			Platforms: platforms,
-			OutputDir: ".fishnet/simulations",
+			Scenario:     scenario,
+			MaxRounds:    rounds,
+			MaxAgents:    agents,
+			Platforms:    platforms,
+			OutputDir:    ".fishnet/simulations",
+			NoLLM:        lowToken,
 		}, ch)
 		close(ch)
 		_ = err
@@ -3377,7 +3583,8 @@ func (m *App) buildDebugInfo() {
 func (m App) viewDebug() string {
 	heading := S.Yellow.Render("Debug Info") + S.Dim.Render("  [D] close")
 	w := m.width - 4
-	panelH := m.height - 8
+	// standalone view (no header/tabs/status): only 3 prefix lines + 2 borders
+	panelH := m.height - 5
 	if panelH < 5 {
 		panelH = 5
 	}
@@ -3426,4 +3633,107 @@ func tickEvery(d time.Duration) tea.Cmd {
 func openBrowser(url string) {
 	// platform-specific open handled by viz package
 	_ = url
+}
+
+// ─── Danger Zone ─────────────────────────────────────────────────────────────
+
+var dangerActions = []struct {
+	label string
+	desc  string
+}{
+	{"Clear Graph", "Delete all nodes, edges, and communities for this project"},
+	{"Clear Sim Data", "Delete all simulation records, posts, and actions"},
+	{"Clear Documents", "Delete all indexed documents and chunks"},
+}
+
+func (m App) viewDanger() string {
+	w := m.width - 4
+	heading := S.Red.Render("⚠  Danger Zone")
+	sub := S.Dim.Render("Irreversible operations — data cannot be recovered")
+
+	var lines []string
+	for i, a := range dangerActions {
+		prefix := "  "
+		nameStyle := S.Muted
+		descStyle := S.Dim
+		if i == m.dangerIdx {
+			prefix = "> "
+			nameStyle = S.Red
+			descStyle = S.Yellow
+		}
+		lines = append(lines, prefix+nameStyle.Render(a.label))
+		lines = append(lines, "    "+descStyle.Render(a.desc))
+		lines = append(lines, "")
+	}
+
+	list := strings.Join(lines, "\n")
+
+	var confirmBlock string
+	if m.dangerConfirm {
+		action := dangerActions[m.dangerIdx].label
+		confirmBlock = "\n" +
+			boxStyleOrange.Width(w-4).Render(
+				S.Red.Render("  Confirm: "+action+"\n\n")+
+					S.Yellow.Render("  This will permanently delete data for project ")+
+					S.Bold.Render(m.cfg.Project)+"\n\n"+
+					S.Red.Render("  Press [y] to confirm, [n] or [esc] to cancel"))
+	}
+
+	var msgLine string
+	if m.dangerMsg != "" {
+		msgLine = "\n  " + m.dangerMsg
+	}
+
+	_ = w
+	return "\n  " + heading + "\n  " + sub + "\n\n  " + list + confirmBlock + msgLine
+}
+
+// dangerDoneMsg carries the result of a danger zone action.
+type dangerDoneMsg struct{ msg string }
+
+func (m *App) execDangerAction() tea.Cmd {
+	m.dangerConfirm = false
+	idx := m.dangerIdx
+	projectID := m.projectID
+	db := m.db
+	return func() tea.Msg {
+		var err error
+		switch idx {
+		case 0:
+			err = db.ClearGraph(projectID)
+		case 1:
+			err = db.ClearSimData(projectID)
+		case 2:
+			err = db.ClearDocuments(projectID)
+		}
+		if err != nil {
+			return dangerDoneMsg{msg: S.Red.Render("Error: " + err.Error())}
+		}
+		return dangerDoneMsg{msg: S.Green.Render("✓ " + dangerActions[idx].label + " completed")}
+	}
+}
+
+// ─── UI State persistence ─────────────────────────────────────────────────────
+
+const uiStatePath = ".fishnet/ui-state.json"
+
+type uiState struct {
+	AnalyzeDir string `json:"analyze_dir"`
+}
+
+func loadAnalyzeDir() string {
+	data, err := os.ReadFile(uiStatePath)
+	if err != nil {
+		return "."
+	}
+	var s uiState
+	if err := json.Unmarshal(data, &s); err != nil || s.AnalyzeDir == "" {
+		return "."
+	}
+	return s.AnalyzeDir
+}
+
+func saveAnalyzeDir(dir string) {
+	data, _ := json.Marshal(uiState{AnalyzeDir: dir})
+	os.WriteFile(uiStatePath, data, 0644) //nolint:errcheck
 }
