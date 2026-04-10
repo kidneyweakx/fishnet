@@ -30,9 +30,7 @@ jobs:
             -v /var/run/docker.sock:/var/run/docker.sock \
             -w /go/src/github.com/kidneyweakx/fishnet \
             -e GITHUB_TOKEN \
-            -e HOMEBREW_TAP_GITHUB_TOKEN \
             ghcr.io/goreleaser/goreleaser-cross:v1.24 \
             release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HOMEBREW_TAP_GITHUB_TOKEN: ${{ secrets.HOMEBREW_TAP_GITHUB_TOKEN }}
