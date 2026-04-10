@@ -58,7 +58,7 @@ Rules:
 type Config struct {
 	Schema         *OntologySchema // optional; if set, guides entity extraction
 	BatchSize      int             // chunks per LLM call (default 3; reduces API calls ~3x)
-	ExtractionMode string          // "local" | "llm" | "hybrid" (default: "local")
+	ExtractionMode string          // "local" | "llm" | "hybrid" | "onnx" (default: "local")
 }
 
 type Builder struct {
@@ -148,6 +148,18 @@ func (b *Builder) BuildFromChunks(
 						onProgress(p)
 					}
 					return
+				}
+			} else if b.config.ExtractionMode == "onnx" {
+				// ONNX multilingual BERT NER — no LLM needed, 100x faster.
+				// Supports Chinese + English natively without translation.
+				onnxEx, onnxErr := NewOnnxExtractor()
+				if onnxErr != nil {
+					// Fallback to local NER if ONNX not available (model not downloaded).
+					localEx := NewLocalExtractor()
+					extracted = localEx.Extract(translateCJKBatch(ctx, b.llm, texts))
+				} else {
+					defer onnxEx.Close()
+					extracted = onnxEx.Extract(texts)
 				}
 			} else {
 				// "local" / "hybrid" / "" — prose NER.

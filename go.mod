@@ -7,7 +7,9 @@ require (
 	github.com/charmbracelet/bubbletea v1.3.10
 	github.com/charmbracelet/lipgloss v1.1.0
 	github.com/google/uuid v1.6.0
+	github.com/pemistahl/lingua-go v1.4.0
 	github.com/spf13/cobra v1.8.0
+	github.com/yalue/onnxruntime_go v1.13.0
 	golang.org/x/time v0.5.0
 	modernc.org/sqlite v1.29.9
 )
@@ -40,11 +42,14 @@ require (
 	github.com/ncruces/go-strftime v0.1.9 // indirect
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
+	github.com/shopspring/decimal v1.3.1 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/xo/terminfo v0.0.0-20220910002029-abceb7e1c41e // indirect
+	golang.org/x/exp v0.0.0-20231108232855-2478ac86f678 // indirect
 	golang.org/x/sys v0.38.0 // indirect
 	golang.org/x/text v0.3.8 // indirect
 	gonum.org/v1/gonum v0.7.0 // indirect
+	google.golang.org/protobuf v1.31.0 // indirect
 	gopkg.in/neurosnap/sentences.v1 v1.0.6 // indirect
 	modernc.org/gc/v3 v3.0.0-20240107210532-573471604cb6 // indirect
 	modernc.org/libc v1.49.3 // indirect
