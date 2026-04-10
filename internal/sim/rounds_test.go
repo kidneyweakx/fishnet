@@ -193,15 +193,15 @@ func TestTruncScenario_Short(t *testing.T) {
 }
 
 func TestTruncScenario_Long(t *testing.T) {
-	// Build a string of 100 runes
+	// Build a string of 2500 runes (above the 2000-rune truncation limit)
 	long := ""
-	for i := 0; i < 100; i++ {
+	for i := 0; i < 2500; i++ {
 		long += "a"
 	}
 	got := truncScenario(long)
-	// Should be truncated to 80 runes + "…"
+	// Should be truncated to 2000 runes + "…"
 	runes := []rune(got)
-	if len(runes) != 81 { // 80 chars + 1 ellipsis rune
-		t.Errorf("truncScenario: expected 81 runes, got %d", len(runes))
+	if len(runes) != 2001 { // 2000 chars + 1 ellipsis rune
+		t.Errorf("truncScenario: expected 2001 runes, got %d", len(runes))
 	}
 }
