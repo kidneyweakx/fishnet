@@ -4,6 +4,72 @@ A fast, local GraphRAG + social simulation CLI — the Go successor to MiroFish.
 
 **~15-20x faster** than Python-based alternatives. No Zep, no REST API, no Docker required.
 
+## What's Improved Over the Original Architecture
+
+fishnet started as a port of MiroFish's core simulation pipeline to Go. This section documents the key architectural improvements made over the Python/Zep original.
+
+### 1. LLM-First Simulation Engine
+
+**Problem in earlier versions:** Agent activity was gated by a hard probability check (`ActivityLevel`) that silently discarded ~52% of simulation rounds before any logic ran. Agents would frequently "do nothing" not because the scenario called for it, but because a random float failed a threshold check.
+
+**What changed:**
+- Removed the `ActivityLevel` hard gate entirely. The simulation no longer pre-rejects agents based on random probability before any decision is made.
+- Active-hours enforcement changed from a 95% hard rejection to a **0.70 soft multiplier** on action probabilities. Agents outside their active window are less likely to act — not silenced.
+- Default `ActivityLevel` range raised from `0.25–0.70` to `0.55–0.90`, reflecting that agents in a simulation are by definition participants, not passive observers.
+- The result: every round produces meaningful action from most agents. Simulation rounds progress naturally instead of stalling.
+
+### 2. Rich Personality Context for LLM Content Generation
+
+**Problem in earlier versions:** The batch LLM call that generates post content received a stripped-down request: agent name, stance, and a topic truncated to 120 characters. Posts sounded generic because the LLM had no persona to write from.
+
+**What changed:**
+- Each content request now includes the agent's `Profession`, `Bio` (up to 150 chars), `Interests`, and `Catchphrases`.
+- If a `Fingerprint` field is set (a compact persona summary), the bio is automatically shortened to avoid redundancy.
+- Topic truncation removed — the full topic text is passed to the LLM.
+- Scenario truncation raised from 80 to 2000 characters, so the LLM sees the actual scenario context.
+- System prompt updated to explicitly instruct the LLM to write in each agent's voice, use their profession and interests, and weave in catchphrases naturally.
+- Posts now sound like distinct characters rather than variations on a template.
+
+### 3. Agent Overview Page (Step 2 Viz)
+
+**Problem in earlier versions:** There was no way to inspect agent profiles before or during a simulation. The only visibility was CLI stats and a D3 graph of entity relationships.
+
+**What changed:**
+- Added a `/step2` browser page served alongside the existing graph visualization.
+- Accessible at the same local server as `fishnet graph web` — navigate to `/step2`.
+- Shows a card grid of all agents, each card layered by information priority:
+
+  | Layer | Content |
+  |-------|---------|
+  | **Top** | Name, entity type (color-coded), stance (green/red/gray/blue), community badge, influence score |
+  | **Middle** | Activity level bar (0–1), sentiment bias bar (−1 to +1), posts/hr and comments/hr |
+  | **Bottom** (expandable) | Big Five personality bars, 24-hour active-window dot chart, entity summary |
+
+- Sort by influence, activity, community, or name. Live keyword filter across name, type, stance, and summary.
+- Design mirrors MiroFish's Step 2 environment setup UI: important facts are immediately visible, configuration details are secondary.
+
+### 4. LLM-Based Interview Agent Selection
+
+**Problem in earlier versions:** The `interview_agents` report tool either required explicit agent names or fell back to selecting the first N agents in the database — no relevance ranking.
+
+**What changed:**
+- Added `selectAgentsLLM`: before running interviews, the LLM is given the full node list (name + type + summary) and asked to select the most relevant agents for the interview topic.
+- Selection reasoning is grounded in each agent's actual role, entity type, and summary — not just alphabetical or insertion order.
+- Falls back gracefully to the first N agents if the LLM call fails or returns unrecognised names.
+- Tool description updated to reflect AI-driven selection.
+
+### Summary
+
+| Area | Before | After |
+|------|--------|-------|
+| Agent activity | ~52% of rounds silently do nothing | All agents participate; probabilities are meaningful |
+| Post content | Generic (name + stance + 120-char topic) | Authentic (persona, profession, interests, catchphrases) |
+| Agent inspection | CLI only | Visual card grid at `/step2` with sort/filter |
+| Interview selection | First N or manual names | LLM picks most relevant agents per topic |
+| Scenario context | Truncated to 80 chars | Full text (up to 2000 chars) passed to LLM |
+
+---
+
 ## Features
 
 - **Knowledge Graph** — Ontology-first entity extraction from any document collection, stored in local SQLite
