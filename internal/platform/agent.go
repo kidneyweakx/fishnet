@@ -2,6 +2,7 @@ package platform
 
 import (
 	"math/rand"
+	"time"
 
 	"fishnet/internal/db"
 )
@@ -52,6 +53,10 @@ type Personality struct {
 	ResponseDelayMin int     `json:"response_delay_min"` // min delay in sim-seconds before reacting
 	ResponseDelayMax int     `json:"response_delay_max"` // max delay in sim-seconds before reacting
 	InfluenceWeight  float64 `json:"influence_weight"`   // 0-2.0, how visible this agent's posts are
+
+	// Location and timezone
+	Location string `json:"location"` // free-text location from social-media bio
+	Timezone string `json:"timezone"` // IANA timezone ID inferred from Location (e.g. "Asia/Taipei")
 
 	// Graph community this agent belongs to (from Louvain detection, -1 if none)
 	CommunityID      int    `json:"community_id"`
@@ -104,6 +109,7 @@ func FromNode(n db.Node, idx int) *Personality {
 		ResponseDelayMax: 60,
 		InfluenceWeight:  0.5 + rng.Float64()*1.5,
 		CommunityID:      -1,
+		Timezone:         "UTC",
 	}
 }
 
@@ -150,7 +156,7 @@ func (p *Personality) stanceToneHint() string {
 // Pure math — zero LLM calls. Reproducible given the same round+agent seed.
 func (p *Personality) Decide(state *State, scenario string, round int) []PlannedAction {
 	timeline := state.Timeline(p.AgentID, 10)
-	return p.decideWithTimeline(timeline, state, scenario, round, state.Platform)
+	return p.decideWithTimeline(timeline, state, scenario, round, -1, state.Platform)
 }
 
 // DecideFromTimeline returns what this agent will do given a pre-built timeline slice.
@@ -158,18 +164,38 @@ func (p *Personality) Decide(state *State, scenario string, round int) []Planned
 // platName should be "twitter" or "reddit"; it controls which action vocabulary is used.
 // For follow actions the state is needed to pick a random post; pass nil to skip follows.
 func (p *Personality) DecideFromTimeline(timeline []*Post, scenario string, round int, platName string) []PlannedAction {
-	return p.decideWithTimeline(timeline, nil, scenario, round, platName)
+	return p.decideWithTimeline(timeline, nil, scenario, round, -1, platName)
+}
+
+// DecideAt is like DecideFromTimeline but uses the wall-clock simulation time
+// to derive the local hour for this agent's timezone, enabling realistic
+// day/night activity patterns across globally distributed agents.
+// Falls back to round%24 if the agent has no timezone set.
+func (p *Personality) DecideAt(timeline []*Post, scenario string, round int, simTime time.Time, platName string) []PlannedAction {
+	localHour := -1
+	tz := p.Timezone
+	if tz == "" {
+		tz = "UTC"
+	}
+	if loc, err := time.LoadLocation(tz); err == nil {
+		localHour = simTime.In(loc).Hour()
+	}
+	return p.decideWithTimeline(timeline, nil, scenario, round, localHour, platName)
 }
 
 // decideWithTimeline is the shared implementation.
 // state may be nil; if so, follow/mute/search actions are skipped.
-func (p *Personality) decideWithTimeline(timeline []*Post, state *State, scenario string, round int, platName string) []PlannedAction {
+// simHour is the agent-local hour derived from the sim clock (-1 = use round%24 fallback).
+func (p *Personality) decideWithTimeline(timeline []*Post, state *State, scenario string, round int, simHour int, platName string) []PlannedAction {
 	rng := rand.New(rand.NewSource(int64(round)*7919 + hashStr(p.AgentID)))
 	isReddit := platName == "reddit"
 
-	// Check active hours: map round to hour of day
+	// Check active hours using sim clock if available, else round%24
 	activityMod := 1.0
-	currentHour := round % 24
+	currentHour := simHour
+	if currentHour < 0 {
+		currentHour = round % 24
+	}
 	if !p.isActiveHour(currentHour) {
 		activityMod = 0.70
 	}

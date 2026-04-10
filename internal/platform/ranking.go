@@ -7,7 +7,7 @@ import (
 	"time"
 )
 
-// FeedWeights controls the 5-factor feed ranking formula.
+// FeedWeights controls the 6-factor feed ranking formula.
 //
 //	Score = w1*Recency + w2*Relevance + w3*Virality + w4*Relationship + w5*CommunityAffinity
 //
@@ -19,6 +19,7 @@ type FeedWeights struct {
 	Virality          float64 // w3: engagement (likes+reposts+comments) weight
 	Relationship      float64 // w4: past-interaction count weight
 	CommunityAffinity float64 // w5: same Louvain community affinity weight
+	DiversityRate     float64 // fraction of feed slots reserved for out-of-community posts [0,1]
 	HalfLifeMin       float64 // recency half-life in real minutes (default: 30)
 }
 
@@ -30,6 +31,7 @@ var DefaultFeedWeights = FeedWeights{
 	Virality:          0.22,
 	Relationship:      0.16,
 	CommunityAffinity: 0.15,
+	DiversityRate:     0.125,
 	HalfLifeMin:       30.0,
 }
 
@@ -56,11 +58,19 @@ func RankedFeed(
 
 	// ── Snapshot under one read-lock ─────────────────────────────────────────
 	state.mu.RLock()
+	// Snapshot seen posts for this agent
+	var seenSnapshot map[string]bool
+	if m, ok := state.seenPosts[p.AgentID]; ok && len(m) > 0 {
+		seenSnapshot = m // read-only snapshot; safe under RLock
+	}
 	pool := make([]*Post, 0, len(state.Posts))
 	maxEng := 0
 	for _, post := range state.Posts {
 		if post.AuthorID == p.AgentID {
 			continue
+		}
+		if seenSnapshot[post.ID] {
+			continue // skip already-seen posts
 		}
 		pool = append(pool, post)
 		if e := post.Likes + post.Reposts + post.Comments; e > maxEng {
@@ -113,6 +123,49 @@ func RankedFeed(
 		}
 		out = append(out, s.post)
 	}
+
+	// ── Diversity injection ───────────────────────────────────────────────────
+	// Replace the last N slots with highest-scoring out-of-community posts,
+	// so filter bubbles don't fully close. Only applies when CommunityAffinity
+	// is active (communityByAuthorID != nil) and DiversityRate > 0.
+	if weights.DiversityRate > 0 && communityByAuthorID != nil && p.CommunityID >= 0 && len(out) > 1 {
+		diverseN := int(math.Ceil(float64(len(out)) * weights.DiversityRate))
+		if diverseN < 1 {
+			diverseN = 1
+		}
+		if diverseN < len(out) {
+			// Build set of posts already in out
+			inOut := make(map[string]bool, len(out))
+			for _, post := range out {
+				inOut[post.ID] = true
+			}
+			// Collect diverse candidates: different community, not already in out
+			var diverse []*Post
+			for _, s := range ranked {
+				if inOut[s.post.ID] {
+					continue
+				}
+				authorID := s.post.AuthorID
+				authorComm, ok := communityByAuthorID[authorID]
+				if !ok {
+					stripped := strings.TrimSuffix(authorID, "_rd")
+					authorComm, ok = communityByAuthorID[stripped]
+				}
+				if ok && authorComm != p.CommunityID {
+					diverse = append(diverse, s.post)
+					if len(diverse) >= diverseN {
+						break
+					}
+				}
+			}
+			// Replace the last diverseN entries of out with diverse posts
+			replaceAt := len(out) - diverseN
+			for i, dp := range diverse {
+				out[replaceAt+i] = dp
+			}
+		}
+	}
+
 	return out
 }
 

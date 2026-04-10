@@ -223,6 +223,9 @@ func actionIcon(typ string) string {
 }
 
 func clip(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
 	runes := []rune(s)
 	if len(runes) <= n {
 		return s

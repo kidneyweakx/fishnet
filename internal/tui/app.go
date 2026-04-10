@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -55,6 +56,14 @@ var tabLabels = []string{
 	"[5] Interview",
 	"[s] Sessions",
 	"[q] History",
+}
+
+var chatPresets = []string{
+	"What topics did you post about most during the simulation?",
+	"Which posts resonated with you the most, and why?",
+	"Did anyone change your perspective during the simulation?",
+	"What was the most important thing you wanted to communicate?",
+	"How do you feel about the way the narrative developed?",
 }
 
 // focusPanel indicates which panel has keyboard focus in split-panel views.
@@ -201,7 +210,7 @@ type App struct {
 	simRunning    bool
 	simDone       bool
 	simBackground bool // run without blocking navigation
-	simNoLLM   bool // template-only mode: zero LLM calls
+	simMode       string // "batch" | "heavy" | "nollm"
 	simRound      int
 	simMaxRounds  int
 	simActions    []platform.Action // rolling last 80
@@ -210,7 +219,10 @@ type App struct {
 	simTwStat     platform.Stats
 	simRdStat     platform.Stats
 	simCh         chan sim.RoundProgress
+	simCancel     context.CancelFunc
 	simStartTime  time.Time
+	simAgentsDone int
+	simAgentsTotal int
 
 	// Step 4: Report
 	reportRunning    bool
@@ -220,10 +232,11 @@ type App struct {
 	reportTools      []string // tool call log during report generation
 
 	// Step 5: Interview
-	chatInput   textinput.Model
-	chatTarget  string // agent name/ID
-	chatHistory []llm.Message
-	chatLines   []string // rendered chat for display
+	chatInput     textinput.Model
+	chatTarget    string // agent name/ID
+	chatHistory   []llm.Message
+	chatLines     []string // rendered chat for display
+	chatPresetIdx int
 
 	// Shared log
 	logs    []string
@@ -241,10 +254,12 @@ type App struct {
 	sessionIdx  int
 
 	// Query/History screen
-	queryTab     int // 0=posts, 1=actions, 2=timeline, 3=stats
-	queryContent string
-	queryLines   []string
-	queryIdx     int
+	queryTab      int // 0=posts, 1=actions, 2=timeline, 3=stats
+	queryContent  string
+	queryLines    []string
+	queryAllLines []string // unfiltered lines for round filter
+	queryIdx      int
+	queryRound    int // -1 = all rounds, 0+ = specific round
 
 	// CLIProxyAPI proxy status
 	proxyOK    bool
@@ -341,12 +356,14 @@ func newApp(cfg *config.Config, database *db.DB, projectID string) App {
 		simRounds:       10,
 		simMaxAgents:    25,
 		simPlatforms:    []string{"twitter", "reddit"},
+		simMode:         sim.ModeHeavy,
 		analyzeDir:      savedDir,
 		analyzeDirInput: di,
 		maxLogs:         80,
 		panelFocus:      focusLeft,
 		wizardName:      wn,
 		wizardDir:       wd,
+		queryRound:      -1,
 	}
 
 	if projectID != "" {
@@ -462,6 +479,10 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.simMaxRounds = prog.MaxRounds
 		m.simTwStat = prog.TwitterStat
 		m.simRdStat = prog.RedditStat
+		if prog.Heartbeat {
+			m.simAgentsDone = prog.AgentsDone
+			m.simAgentsTotal = prog.AgentsTotal
+		}
 		if prog.Action.AgentName != "" {
 			m.simActions = append(m.simActions, prog.Action)
 			if len(m.simActions) > 80 {
@@ -484,6 +505,8 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		for _, logLine := range prog.Logs {
 			m.addLog(logLine)
 		}
+		// Keep drain loop alive — simProgressMsg doesn't auto-reschedule
+		cmds = append(cmds, m.drainSimCh())
 
 	case simDoneMsg:
 		m.simRunning = false
@@ -573,6 +596,7 @@ func (m App) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case queryDataMsg:
 		if msg.tab == m.queryTab {
 			m.queryLines = msg.lines
+			m.queryAllLines = msg.lines
 			m.queryIdx = 0
 		}
 
@@ -774,7 +798,7 @@ func (m *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if m.screen == screenSim && m.simInput.Focused() && !m.simRunning {
 		switch msg.String() {
 		case "ctrl+c":
-			return tea.Quit
+			return tea.Quit // sim not running, safe to quit
 		case "esc":
 			m.simInput.Blur()
 			return nil
@@ -814,6 +838,10 @@ func (m *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 	if m.screen != screenHelp {
 		switch msg.String() {
 		case "ctrl+c":
+			if m.simRunning {
+				m.stopSim()
+				return nil
+			}
 			return tea.Quit
 		case "D": // uppercase D to toggle debug info overlay
 			if m.screen == screenDebug {
@@ -1051,7 +1079,26 @@ func (m *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 			}
 		case "l", "L":
 			if !m.simRunning {
-				m.simNoLLM = !m.simNoLLM
+				switch m.simMode {
+				case sim.ModeHeavy:
+					m.simMode = sim.ModeBatch
+				case sim.ModeBatch:
+					m.simMode = sim.ModeNoLLM
+				default:
+					m.simMode = sim.ModeHeavy
+				}
+			}
+		case "s", "S":
+			if m.simRunning {
+				m.stopSim()
+			}
+		default:
+			// Re-focus input on any non-command key while blurred
+			if !m.simRunning && !m.simInput.Focused() {
+				if r := []rune(msg.String()); len(r) == 1 && r[0] >= 32 {
+					m.simInput.Focus()
+					m.simInput.SetValue(m.simInput.Value() + string(r))
+				}
 			}
 		}
 
@@ -1127,6 +1174,11 @@ func (m *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 					m.entityIdx++
 				}
 			}
+		case "ctrl+p":
+			if m.panelFocus == focusRight {
+				m.chatPresetIdx = (m.chatPresetIdx + 1) % len(chatPresets)
+				m.chatInput.SetValue(chatPresets[m.chatPresetIdx])
+			}
 		case "l", "right":
 			m.panelFocus = focusRight
 			m.chatInput.Focus()
@@ -1188,6 +1240,23 @@ func (m *App) handleKey(msg tea.KeyMsg) tea.Cmd {
 			}
 		case "r":
 			return m.loadQueryData()
+		case "right", "l":
+			maxRound := m.simMaxRounds
+			if maxRound <= 0 {
+				maxRound = 10
+			}
+			if m.queryRound < maxRound {
+				m.queryRound++
+			}
+			m.queryIdx = 0
+		case "left", "h":
+			if m.queryRound > -1 {
+				m.queryRound-- // -1 = all
+			}
+			m.queryIdx = 0
+		case "0":
+			m.queryRound = -1
+			m.queryIdx = 0
 		}
 	}
 	return nil
@@ -1205,9 +1274,24 @@ func (m *App) updateReportViewport() {
 }
 
 // filteredNodes returns graphNodes filtered by entitySearch.
+// When not searching, nodes are sorted by influence descending.
 func (m *App) filteredNodes() []db.Node {
 	if m.entitySearch == "" {
-		return m.graphNodes
+		sorted := make([]db.Node, len(m.graphNodes))
+		copy(sorted, m.graphNodes)
+		sort.Slice(sorted, func(i, j int) bool {
+			influenceOf := func(n db.Node) float64 {
+				attrs := parseAttrs(n.Attributes)
+				if v, ok := attrs["influence"]; ok {
+					var f float64
+					fmt.Sscanf(v, "%f", &f)
+					return f
+				}
+				return 0.0
+			}
+			return influenceOf(sorted[i]) > influenceOf(sorted[j])
+		})
+		return sorted
 	}
 	q := strings.ToLower(m.entitySearch)
 	var out []db.Node
@@ -1474,7 +1558,12 @@ func (m App) renderTabs() string {
 			parts = append(parts, tabInactiveStyle.Render(label))
 		}
 	}
-	return lipgloss.JoinHorizontal(lipgloss.Top, parts...)
+	tabBar := lipgloss.JoinHorizontal(lipgloss.Top, parts...)
+	if m.simBackground && m.simRunning {
+		indicator := "  " + S.Red.Render("●") + S.Yellow.Render(fmt.Sprintf(" r%d/%d", m.simRound, m.simMaxRounds))
+		tabBar += indicator
+	}
+	return tabBar
 }
 
 func (m App) renderStatus() string {
@@ -1482,11 +1571,13 @@ func (m App) renderStatus() string {
 
 	// Background sim indicator overrides per-screen hints when active.
 	if m.simRunning && m.simBackground && m.screen != screenSim {
-		elapsed := ""
+		elapsedPart := ""
 		if !m.simStartTime.IsZero() {
-			elapsed = "  elapsed: " + elapsedStr(time.Since(m.simStartTime))
+			elapsedPart = elapsedStr(time.Since(m.simStartTime))
 		}
-		hint = S.Yellow.Render("● Sim running in background") + S.Dim.Render("  · [3] watch feed  [ctrl+c] stop"+elapsed)
+		hint = S.Red.Render("●") +
+			S.Yellow.Render(fmt.Sprintf(" sim  round %d/%d", m.simRound, m.simMaxRounds)) +
+			S.Dim.Render(fmt.Sprintf("  %s  [3] watch  [s] stop", elapsedPart))
 		return statusBarStyle.Width(m.width).Render("  " + hint)
 	}
 
@@ -1511,18 +1602,18 @@ func (m App) renderStatus() string {
 			if !m.simStartTime.IsZero() {
 				elapsed = "  elapsed: " + elapsedStr(time.Since(m.simStartTime))
 			}
-			hint = S.Yellow.Render("● Running") + S.Dim.Render(elapsed+"  [ctrl+c] stop")
+			hint = S.Yellow.Render("● Running") + S.Dim.Render(elapsed+"  [s] stop")
 		} else {
 			hint = "[enter] run  [b] run in background  [r/R] rounds ±1  [esc] home"
 		}
 	case screenReport:
 		hint = "[r/g] generate  [s] save report.md  [←→/hl] switch panel  [↑↓] navigate/scroll  [esc] home"
 	case screenChat:
-		hint = "[↑↓] select agent  [enter/l] chat  [tab] next agent  [h] agent list  [esc] home"
+		hint = "[↑↓] select agent  [enter/l] chat  [tab] next agent  [h] agent list  [ctrl+p] preset  [esc] home"
 	case screenSession:
 		hint = "[↑↓] navigate  [enter] load  [f] fork  [d] delete  [n] save current  [esc] home"
 	case screenQuery:
-		hint = "[tab] switch view  [↑↓] scroll  [r] refresh  [esc] home"
+		hint = "[tab] switch view  [↑↓] scroll  [←/→] round filter  [0] all rounds  [r] refresh  [esc] home"
 	case screenHelp:
 		hint = "[esc/q] close help"
 	case screenDanger:
@@ -1824,7 +1915,19 @@ func (m App) viewEntities() string {
 			prefix = "> "
 			nameStyle = S.White
 		}
-		line := prefix + nameStyle.Render(clip(n.Name, leftW-13)) + "  " + typeStr
+		// Stance color prefix
+		stanceAttrs := parseAttrs(n.Attributes)
+		stanceVal := strings.ToLower(stanceAttrs["stance"])
+		var stancePrefix string
+		switch stanceVal {
+		case "supportive", "pro", "positive":
+			stancePrefix = S.Green.Render("[S]")
+		case "opposing", "against", "negative":
+			stancePrefix = S.Red.Render("[O]")
+		default:
+			stancePrefix = S.Yellow.Render("[N]")
+		}
+		line := prefix + stancePrefix + " " + nameStyle.Render(clip(n.Name, leftW-17)) + "  " + typeStr
 		if i == m.entityIdx {
 			listLines = append(listLines, selectedStyle.Width(leftW-2).Render(line))
 		} else {
@@ -1974,22 +2077,61 @@ func (m App) renderEntityDetail(n db.Node, w int) string {
 		}
 		sb.WriteString(traitBar(t.label, val, barW) + "\n")
 	}
-	// Always show core 4 even if missing
-	coreTraits := []trait{
-		{"activity", "Activity"},
-		{"sentiment", "Sentiment"},
-		{"influence", "Influence"},
-		{"originality", "Originality"},
-	}
-	for _, t := range coreTraits {
-		if _, exists := attrs[t.key]; !exists {
-			sb.WriteString(traitBar(t.label, 0.5, barW) + "\n")
+	// Show hint if no personality traits configured yet
+	coreKeys := []string{"activity", "sentiment", "influence", "originality"}
+	hasCoreTraits := false
+	for _, k := range coreKeys {
+		if _, exists := attrs[k]; exists {
+			hasCoreTraits = true
+			break
 		}
+	}
+	if !hasCoreTraits {
+		sb.WriteString("  " + S.Dim.Render("(personality not configured — run sim to generate)") + "\n")
 	}
 
 	// Topics of interest
 	if topics, ok := attrs["topics"]; ok && topics != "" {
 		sb.WriteString("\n  " + S.Blue.Render("Topics:") + " " + S.Muted.Render(clip(topics, w-12)) + "\n")
+	}
+
+	// Bio
+	if bio, ok := attrs["bio"]; ok && bio != "" {
+		sb.WriteString("\n  " + S.Blue.Render("Bio:") + "\n")
+		words := strings.Fields(bio)
+		lineW := w - 4
+		var bioLine string
+		var bioLines []string
+		for _, word := range words {
+			if len(bioLine)+len(word)+1 > lineW {
+				bioLines = append(bioLines, bioLine)
+				bioLine = word
+			} else {
+				if bioLine == "" {
+					bioLine = word
+				} else {
+					bioLine += " " + word
+				}
+			}
+		}
+		if bioLine != "" {
+			bioLines = append(bioLines, bioLine)
+		}
+		sb.WriteString("  " + S.Muted.Render(strings.Join(bioLines, "\n  ")) + "\n")
+	}
+
+	// Catchphrases
+	if cpRaw, ok := attrs["catchphrases"]; ok && cpRaw != "" {
+		var phrases []string
+		if err := json.Unmarshal([]byte(cpRaw), &phrases); err == nil && len(phrases) > 0 {
+			if len(phrases) > 3 {
+				phrases = phrases[:3]
+			}
+			sb.WriteString("\n  " + S.Blue.Render("Says:") + "\n")
+			for _, p := range phrases {
+				sb.WriteString("  " + S.Muted.Render("• "+clip(p, w-6)) + "\n")
+			}
+		}
 	}
 
 	sb.WriteString("\n")
@@ -2081,9 +2223,14 @@ func (m App) viewSim() string {
 		agentCount = len(m.graphNodes)
 	}
 
-	modeStr := S.Green.Render("● Batch") + S.Dim.Render("  (1 LLM call/round, fastest with quality)")
-	if m.simNoLLM {
+	var modeStr string
+	switch m.simMode {
+	case sim.ModeNoLLM:
 		modeStr = S.Yellow.Render("◐ No-LLM") + S.Dim.Render("  (templates only, zero token cost)")
+	case sim.ModeBatch:
+		modeStr = S.Green.Render("● Batch") + S.Dim.Render("  (1 LLM call/round, fastest with quality)")
+	default: // ModeHeavy
+		modeStr = S.Purple.Render("◆ Heavy") + S.Dim.Render("  (1 LLM call/agent/round, most authentic)")
 	}
 
 	cfgBlock := "  " + S.Bold.Render("Settings") + "\n" +
@@ -2098,7 +2245,7 @@ func (m App) viewSim() string {
 
 	actions := "\n  " + S.Green.Render("[enter]") + S.Dim.Render(" Start simulation    ") +
 		S.Yellow.Render("[b]") + S.Dim.Render(" Run in background") + bgFlag + "    " +
-		S.Blue.Render("[l]") + S.Dim.Render(" Toggle mode")
+		S.Blue.Render("[l]") + S.Dim.Render(" Cycle mode: heavy→batch→nollm")
 
 	return "\n  " + heading + "\n\n" +
 		scenarioBox + "\n\n" +
@@ -2130,10 +2277,15 @@ func (m App) viewSimRunning() string {
 	} else {
 		spinSuffix = "  " + S.Green.Render("✓ Done")
 	}
-	roundHeader := fmt.Sprintf("  Round %s/%s  [%s] %d%%%s          Elapsed: %s",
+	// Agent progress indicator (heavy mode heartbeat)
+	agentProgress := ""
+	if m.simAgentsTotal > 0 && !m.simDone {
+		agentProgress = "  " + S.Dim.Render(fmt.Sprintf("agents %d/%d", m.simAgentsDone, m.simAgentsTotal))
+	}
+	roundHeader := fmt.Sprintf("  Round %s/%s  [%s] %d%%%s%s          Elapsed: %s",
 		S.Bold.Render(fmt.Sprint(m.simRound)),
 		S.Muted.Render(fmt.Sprint(m.simMaxRounds)),
-		bar, pct, spinSuffix,
+		bar, pct, spinSuffix, agentProgress,
 		S.Muted.Render(elapsed))
 
 	// ── Platform stat boxes (Twitter | Reddit) ────────────────────────────
@@ -2432,8 +2584,43 @@ func (m App) viewChat() string {
 		chatTitle = "Chat: " + m.chatTarget
 	}
 
+	// ── Context bar ────────────────────────────────────────────────────────
+	var contextBar string
+	if m.chatTarget != "" {
+		var stance string
+		for _, n := range m.graphNodes {
+			if n.Name == m.chatTarget {
+				stance = parseAttrs(n.Attributes)["stance"]
+				break
+			}
+		}
+
+		var posts, likes int
+		for _, a := range m.simActions {
+			if a.AgentName == m.chatTarget {
+				switch a.Type {
+				case platform.ActCreatePost, platform.ActCreateComment, platform.ActQuotePost:
+					posts++
+				case platform.ActLikePost, platform.ActLikeComment:
+					likes++
+				}
+			}
+		}
+
+		contextBar = S.Muted.Render("Talking to: ") + S.Blue.Render(m.chatTarget)
+		if stance != "" {
+			contextBar += S.Dim.Render(" | ") + stanceStyle(stance)
+		}
+		if posts > 0 || likes > 0 {
+			contextBar += S.Dim.Render(fmt.Sprintf(" | %d posts · %d likes in sim", posts, likes))
+		}
+	}
+
 	// Chat history
 	chatH := panelH - 5
+	if contextBar != "" {
+		chatH -= 3 // blank line + context bar + separator
+	}
 	lines := m.chatLines
 	if len(lines) > chatH {
 		lines = lines[len(lines)-chatH:]
@@ -2461,7 +2648,11 @@ func (m App) viewChat() string {
 	} else if m.chatTarget == "" {
 		rightContent = "\n  " + S.Yellow.Render("No agents yet. Analyze documents first: [1]")
 	} else {
-		rightContent = chatText + "\n" + sep + "\n" + inputPrompt
+		contextSection := ""
+		if contextBar != "" {
+			contextSection = "\n  " + contextBar + "\n" + S.Dim.Render("  "+strings.Repeat("─", rightW-4)) + "\n"
+		}
+		rightContent = contextSection + chatText + "\n" + sep + "\n" + inputPrompt
 	}
 
 	var rightPanel string
@@ -2740,11 +2931,35 @@ func (m App) viewQuery() string {
 	}
 	tabBar := lipgloss.JoinHorizontal(lipgloss.Top, tabParts...)
 
-	// 5 pre-panel lines: blank + heading + blank + tabBar + blank
-	panelH := m.availPanelH(5)
+	// Round filter line
+	var roundFilter string
+	if m.queryRound == -1 {
+		roundFilter = S.Dim.Render("  Round: [all]  [←/→] filter by round")
+	} else {
+		roundFilter = S.Muted.Render("  Round: ") +
+			S.Yellow.Render(fmt.Sprintf("%d", m.queryRound)) +
+			S.Dim.Render("  [←] prev  [→] next  [0] all")
+	}
+
+	// 7 pre-panel lines: blank + heading + blank + tabBar + blank + roundFilter + blank
+	panelH := m.availPanelH(7)
+
+	// Determine which lines to display (apply round filter if needed).
+	sourceLines := m.queryLines
+	if m.queryRound >= 0 && len(m.queryAllLines) > 0 {
+		sourceLines = nil
+		for _, line := range m.queryAllLines {
+			if lineMatchesRound(line, m.queryRound) {
+				sourceLines = append(sourceLines, line)
+			}
+		}
+		if len(sourceLines) == 0 {
+			sourceLines = []string{S.Dim.Render(fmt.Sprintf("  No data for round %d.", m.queryRound))}
+		}
+	}
 
 	var displayLines []string
-	if len(m.queryLines) == 0 {
+	if len(sourceLines) == 0 {
 		if m.projectID == "" {
 			displayLines = append(displayLines, S.Dim.Render("  No project loaded."))
 		} else {
@@ -2753,16 +2968,28 @@ func (m App) viewQuery() string {
 	} else {
 		start := m.queryIdx
 		end := start + panelH
-		if end > len(m.queryLines) {
-			end = len(m.queryLines)
+		if end > len(sourceLines) {
+			end = len(sourceLines)
 		}
-		displayLines = m.queryLines[start:end]
+		displayLines = sourceLines[start:end]
 	}
 
 	content := strings.Join(displayLines, "\n")
 	panel := boxStyle.Width(w).Render(content)
 
-	return "\n  " + heading + "\n\n  " + tabBar + "\n\n  " + panel
+	return "\n  " + heading + "\n\n  " + tabBar + "\n\n" + roundFilter + "\n\n  " + panel
+}
+
+// lineMatchesRound returns true if the raw display line contains a round marker for the given round.
+func lineMatchesRound(line string, round int) bool {
+	r := fmt.Sprintf("r%d", round)
+	rPad := fmt.Sprintf("r%02d", round)
+	return strings.Contains(line, r+" ") ||
+		strings.Contains(line, r+"\t") ||
+		strings.Contains(line, "["+r+"]") ||
+		strings.Contains(line, rPad+" ") ||
+		strings.Contains(line, rPad+"\t") ||
+		strings.Contains(line, "["+rPad+"]")
 }
 
 // ─── Wizard Key Handler ───────────────────────────────────────────────────────
@@ -3289,6 +3516,14 @@ func (m *App) startAnalyze() tea.Cmd {
 	}
 }
 
+func (m *App) stopSim() {
+	if m.simCancel != nil {
+		m.simCancel()
+		m.simCancel = nil
+	}
+	m.addLog("⊘ Simulation stopped by user")
+}
+
 func (m *App) startSim() tea.Cmd {
 	m.simRunning = true
 	m.simDone = false
@@ -3297,7 +3532,7 @@ func (m *App) startSim() tea.Cmd {
 	m.simStartTime = time.Now()
 	m.addLog("→ Simulation: " + clip(m.simScenario, 50))
 
-	ch := make(chan sim.RoundProgress, 200)
+	ch := make(chan sim.RoundProgress, 2000)
 	m.simCh = ch
 
 	cfg := m.cfg
@@ -3317,17 +3552,23 @@ func (m *App) startSim() tea.Cmd {
 	}
 	cfg.LLM.APIKey = apiKey
 
-	lowToken := m.simNoLLM
+	simMode := m.simMode
+	if simMode == "" {
+		simMode = sim.ModeHeavy
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	m.simCancel = cancel
 	go func() {
+		defer cancel()
 		client := llm.New(cfg.LLM)
 		ps := sim.NewPlatformSim(database, client)
-		err := ps.Run(context.Background(), projectID, sim.RoundConfig{
-			Scenario:     scenario,
-			MaxRounds:    rounds,
-			MaxAgents:    agents,
-			Platforms:    platforms,
-			OutputDir:    ".fishnet/simulations",
-			NoLLM:        lowToken,
+		err := ps.Run(ctx, projectID, sim.RoundConfig{
+			Scenario:  scenario,
+			MaxRounds: rounds,
+			MaxAgents: agents,
+			Platforms: platforms,
+			OutputDir: ".fishnet/simulations",
+			Mode:      simMode,
 		}, ch)
 		close(ch)
 		_ = err
@@ -3343,8 +3584,11 @@ func (m *App) drainSimCh() tea.Cmd {
 	}
 
 	return func() tea.Msg {
-		// Non-blocking drain: read up to 5 events
-		for i := 0; i < 5; i++ {
+		// Drain up to 50 events; return the last one seen so the UI reflects
+		// the most recent state. Without this, heavy mode floods the channel
+		// faster than a 1-event-per-tick drain can handle.
+		var last *sim.RoundProgress
+		for i := 0; i < 50; i++ {
 			select {
 			case prog, ok := <-ch:
 				if !ok {
@@ -3353,10 +3597,17 @@ func (m *App) drainSimCh() tea.Cmd {
 				if prog.Done {
 					return simDoneMsg{}
 				}
-				return simProgressMsg{prog: prog}
+				p := prog
+				last = &p
 			default:
+				if last != nil {
+					return simProgressMsg{prog: *last}
+				}
 				return tickEvery(100 * time.Millisecond)()
 			}
+		}
+		if last != nil {
+			return simProgressMsg{prog: *last}
 		}
 		return tickEvery(100 * time.Millisecond)()
 	}
@@ -3437,7 +3688,7 @@ func (m *App) openWebViz() tea.Cmd {
 	database := m.db
 	projectID := m.projectID
 	return func() tea.Msg {
-		url, err := viz.Serve(database, projectID)
+		url, err := viz.Serve(database, projectID, llm.New(m.cfg.LLM))
 		if err != nil {
 			return logMsg{"✗ viz: " + err.Error()}
 		}

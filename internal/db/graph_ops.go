@@ -33,10 +33,20 @@ func (d *DB) ReplaceNodeInEdges(oldNodeID, newNodeID string) error {
 	return err
 }
 
-// DeleteNode removes a node by its ID.
+// DeleteNode removes a node and all its connected edges by node ID.
 func (d *DB) DeleteNode(nodeID string) error {
-	_, err := d.Exec(`DELETE FROM nodes WHERE id = ?`, nodeID)
-	return err
+	tx, err := d.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`DELETE FROM edges WHERE source_id = ? OR target_id = ?`, nodeID, nodeID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM nodes WHERE id = ?`, nodeID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // UpdatePageRank sets the pagerank score for a node.

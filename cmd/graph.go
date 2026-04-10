@@ -80,7 +80,9 @@ var graphWebCmd = &cobra.Command{
 			return err
 		}
 
-		url, err := viz.Serve(database, projectID)
+		resolveAPIKey()
+		client := llm.New(cfg.LLM)
+		url, err := viz.Serve(database, projectID, client)
 		if err != nil {
 			return err
 		}

@@ -86,8 +86,19 @@ fishnet started as a port of MiroFish's core simulation pipeline to Go. This sec
 
 ## Installation
 
+### Homebrew (macOS / Linux)
+
 ```bash
-git clone https://github.com/yourname/fishnet
+brew tap kidneyweakx/fishnet https://github.com/kidneyweakx/fishnet
+brew install fishnet
+```
+
+> **Note:** The full URL is required because the formula lives in the `fishnet` repo itself (not a separate `homebrew-fishnet` repo).
+
+### Build from source
+
+```bash
+git clone https://github.com/kidneyweakx/fishnet
 cd fishnet
 go build -o fishnet .
 ```
@@ -95,7 +106,7 @@ go build -o fishnet .
 Or install globally:
 
 ```bash
-go install .
+go install github.com/kidneyweakx/fishnet@latest
 ```
 
 **Requirements:** Go 1.21+, an LLM API key (OpenAI, Anthropic, Ollama, or Codex)

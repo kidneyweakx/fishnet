@@ -42,6 +42,14 @@ type SimMetrics struct {
 	TotalPosts   int
 	TotalReposts int
 	TotalLikes   int
+
+	// EchoChamberByRound is the fraction of within-community engagement per round.
+	// 0.0 = all cross-community, 1.0 = fully siloed. Only populated when
+	// personality community data is available.
+	EchoChamberByRound []float64
+
+	// EchoChamberFinal is the echo chamber coefficient for the last round only.
+	EchoChamberFinal float64
 }
 
 // KCoreLevel holds the k-core penetration result for a given k value.
@@ -77,6 +85,13 @@ func ComputeMetrics(actions []platform.Action, personalities []*platform.Persona
 	for _, p := range personalities {
 		if p != nil {
 			stanceByAgent[p.AgentID] = p.Stance
+		}
+	}
+
+	communityByAgent := make(map[string]int, len(personalities))
+	for _, p := range personalities {
+		if p != nil && p.CommunityID >= 0 {
+			communityByAgent[p.AgentID] = p.CommunityID
 		}
 	}
 
@@ -151,6 +166,48 @@ func ComputeMetrics(actions []platform.Action, personalities []*platform.Persona
 				ps.repostsByRound[a.Round]++
 			}
 		}
+	}
+
+	// ── 0. Echo Chamber Coefficient by round ─────────────────────────────────────
+	// For each round: fraction of LIKE/REPOST actions where viewer and author
+	// are in the same Louvain community.
+	type roundEng struct{ total, same int }
+	engByRound := make(map[int]*roundEng)
+	if len(communityByAgent) > 0 {
+		for _, a := range actions {
+			switch a.Type {
+			case platform.ActLikePost, platform.ActRepost, platform.ActQuotePost:
+				if a.PostID == "" {
+					continue
+				}
+				ps, ok := postIndex[a.PostID]
+				if !ok {
+					continue
+				}
+				viewerComm, vOK := communityByAgent[a.AgentID]
+				authorComm, aOK := communityByAgent[ps.authorID]
+				if !vOK || !aOK {
+					continue
+				}
+				if engByRound[a.Round] == nil {
+					engByRound[a.Round] = &roundEng{}
+				}
+				engByRound[a.Round].total++
+				if viewerComm == authorComm {
+					engByRound[a.Round].same++
+				}
+			}
+		}
+	}
+	echoChamberByRound := make([]float64, maxRound+1)
+	for r := 1; r <= maxRound; r++ {
+		if e := engByRound[r]; e != nil && e.total > 0 {
+			echoChamberByRound[r] = float64(e.same) / float64(e.total)
+		}
+	}
+	echoChamberFinal := 0.0
+	if maxRound >= 1 && len(echoChamberByRound) > maxRound {
+		echoChamberFinal = echoChamberByRound[maxRound]
 	}
 
 	// ── 1. Branching Factor (R0) by round ─────────────────────────────────────
@@ -299,16 +356,18 @@ func ComputeMetrics(actions []platform.Action, personalities []*platform.Persona
 	}
 
 	return SimMetrics{
-		BranchingFactor:   overallR0,
-		BranchingByRound:  branchingByRound[1:], // strip round-0 padding
-		KCoreReach:        kCoreReach,
-		SentimentPolarity: sentimentPolarity[1:],
-		TimeToPeak:        timeToPeak,
-		TopInfluencers:    infList,
-		MaxRounds:         maxRound,
-		TotalPosts:        totalPosts,
-		TotalReposts:      totalReposts,
-		TotalLikes:        sumMap(roundLikes),
+		BranchingFactor:    overallR0,
+		BranchingByRound:   branchingByRound[1:], // strip round-0 padding
+		KCoreReach:         kCoreReach,
+		SentimentPolarity:  sentimentPolarity[1:],
+		TimeToPeak:         timeToPeak,
+		TopInfluencers:     infList,
+		MaxRounds:          maxRound,
+		TotalPosts:         totalPosts,
+		TotalReposts:       totalReposts,
+		TotalLikes:         sumMap(roundLikes),
+		EchoChamberByRound: echoChamberByRound[1:], // strip round-0 padding
+		EchoChamberFinal:   echoChamberFinal,
 	}
 }
 
@@ -328,6 +387,9 @@ func RenderMetricsReport(m SimMetrics) string {
 	sb.WriteString(fmt.Sprintf("| Total Reposts | %d |\n", m.TotalReposts))
 	sb.WriteString(fmt.Sprintf("| Total Likes | %d |\n", m.TotalLikes))
 	sb.WriteString(fmt.Sprintf("| Branching Factor (R₀) | **%.2f** |\n", m.BranchingFactor))
+	if m.EchoChamberFinal > 0 {
+		sb.WriteString(fmt.Sprintf("| Echo Chamber (final round) | **%.2f** |\n", m.EchoChamberFinal))
+	}
 	if m.BranchingFactor >= 1.5 {
 		sb.WriteString("| Spread Assessment | 🔥 Viral (R₀ ≥ 1.5) |\n")
 	} else if m.BranchingFactor >= 1.0 {
@@ -439,6 +501,25 @@ func RenderMetricsReport(m SimMetrics) string {
 		sb.WriteString("\n")
 	}
 
+	// ── 6. Echo Chamber Coefficient ──────────────────────────────────────────
+	if len(m.EchoChamberByRound) > 0 {
+		sb.WriteString("### 6. Echo Chamber Coefficient by Round\n\n")
+		sb.WriteString("_Fraction of engagement (likes/reposts) targeting same-community content._\n")
+		sb.WriteString("_0.0 = fully cross-community, 1.0 = total echo chamber._\n\n")
+		sb.WriteString("```\n")
+		for i, v := range m.EchoChamberByRound {
+			bar := asciiBar(v, 1.0, 30)
+			label := "open"
+			if v >= 0.8 {
+				label = "siloed"
+			} else if v >= 0.5 {
+				label = "leaning"
+			}
+			sb.WriteString(fmt.Sprintf("R%-2d %s %.2f  %s\n", i+1, bar, v, label))
+		}
+		sb.WriteString("```\n\n")
+	}
+
 	// ── Interpretation ────────────────────────────────────────────────────────
 	sb.WriteString("### Interpretation\n\n")
 	sb.WriteString(interpretMetrics(m))
@@ -506,6 +587,24 @@ func interpretMetrics(m SimMetrics) string {
 			polarityAdvice(avgPolarity)))
 	}
 
+	// Echo chamber interpretation
+	if m.EchoChamberFinal > 0 {
+		trend := "stable"
+		if len(m.EchoChamberByRound) >= 3 {
+			first := m.EchoChamberByRound[0]
+			last := m.EchoChamberByRound[len(m.EchoChamberByRound)-1]
+			if last-first > 0.1 {
+				trend = "increasing (filter bubble forming)"
+			} else if first-last > 0.1 {
+				trend = "decreasing (cross-community mixing)"
+			}
+		}
+		parts = append(parts, fmt.Sprintf(
+			"**Echo chamber coefficient** ended at %.2f (trend: %s). %s",
+			m.EchoChamberFinal, trend,
+			echoChamberAdvice(m.EchoChamberFinal)))
+	}
+
 	// Time-to-Peak interpretation
 	if len(m.TimeToPeak) > 0 {
 		immediate := 0
@@ -539,6 +638,18 @@ func polarityAdvice(avg float64) string {
 	}
 	return "Low polarity: the audience largely agrees (or is indifferent). " +
 		"This is stable but may indicate limited engagement breadth."
+}
+
+func echoChamberAdvice(v float64) string {
+	if v >= 0.75 {
+		return "Strong echo chamber: agents primarily engage within their own community. " +
+			"Diversity injection or cross-community seeding is needed to break the silo."
+	} else if v >= 0.45 {
+		return "Moderate echo chamber: some cross-community engagement exists but the majority " +
+			"of interactions stay within community boundaries."
+	}
+	return "Weak echo chamber: agents engage broadly across communities. " +
+		"The feed algorithm is successfully promoting diverse content discovery."
 }
 
 // ─── ASCII chart helpers ──────────────────────────────────────────────────────

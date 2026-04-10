@@ -187,6 +187,10 @@ type State struct {
 	// interestDrift tracks tag frequency accumulated from liked posts per agent.
 	// interestDrift[agentID][tag] = count of times agent liked content with this tag
 	interestDrift map[string]map[string]int
+
+	// seenPosts tracks which post IDs each agent has already seen in their feed.
+	// seenPosts[agentID][postID] = true
+	seenPosts map[string]map[string]bool
 }
 
 func NewState(platform string) *State {
@@ -196,6 +200,7 @@ func NewState(platform string) *State {
 		Users:         make(map[string]*User),
 		interactions:  make(map[string]map[string]int),
 		interestDrift: make(map[string]map[string]int),
+		seenPosts:     make(map[string]map[string]bool),
 	}
 }
 
@@ -254,6 +259,22 @@ func (s *State) GetInterestDrift(agentID string) map[string]int {
 		out[k] = v
 	}
 	return out
+}
+
+// MarkSeen records that agentID has seen the given post IDs in their feed.
+// Subsequent calls to RankedFeed will exclude these posts from the pool.
+func (s *State) MarkSeen(agentID string, postIDs []string) {
+	if agentID == "" || len(postIDs) == 0 {
+		return
+	}
+	s.mu.Lock()
+	if s.seenPosts[agentID] == nil {
+		s.seenPosts[agentID] = make(map[string]bool, len(postIDs))
+	}
+	for _, id := range postIDs {
+		s.seenPosts[agentID][id] = true
+	}
+	s.mu.Unlock()
 }
 
 // PostTags returns the tags for a post, or nil if the post is not found.
@@ -555,6 +576,22 @@ func ExtractTags(content string) []string {
 				tags = append(tags, tag)
 			}
 		}
+	}
+	return tags
+}
+
+// PostTagsOrFallback returns the tags for the given content. If ExtractTags
+// returns nothing, it falls back to the first min(2, len(interests)) agent
+// interest strings — ensuring every post has at least some topic signal.
+func PostTagsOrFallback(content string, interests []string) []string {
+	tags := ExtractTags(content)
+	if len(tags) == 0 && len(interests) > 0 {
+		n := 2
+		if len(interests) < n {
+			n = len(interests)
+		}
+		tags = make([]string, n)
+		copy(tags, interests[:n])
 	}
 	return tags
 }

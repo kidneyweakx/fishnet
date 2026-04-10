@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -76,7 +77,21 @@ type RoundConfig struct {
 
 	// NoLLM disables ALL LLM calls (legacy flag; sets Mode = ModeNoLLM when Mode is "").
 	NoLLM bool
+
+	// Simulation clock settings.
+	// SimStartTime is the wall-clock moment that corresponds to round 1.
+	// Defaults to time.Now() at Run() entry if zero.
+	SimStartTime time.Time
+
+	// MinutesPerRound is how many simulated minutes each round represents.
+	// Defaults to 60 (1 hour per round) if zero.
+	// Example: 60 → each round = 1 hour; 10 → each round = 10 minutes.
+	MinutesPerRound int
 }
+
+// heavyAgentTimeout is the per-agent deadline for a single heavyDecide call.
+// Agents that exceed this are treated as DO_NOTHING so the round can proceed.
+const heavyAgentTimeout = 45 * time.Second
 
 // RoundProgress is one event emitted during simulation.
 type RoundProgress struct {
@@ -90,6 +105,13 @@ type RoundProgress struct {
 	Logs         []string           // non-fatal log messages (e.g. graph memory errors)
 	Intervention *InterventionEvent // set if an intervention was applied this round
 	Paused       bool               // true when the sim has just been paused; false when resumed
+	// Heartbeat fields — set when no Action is present, for UI liveness feedback.
+	Heartbeat   bool
+	AgentsDone  int
+	AgentsTotal int
+	// SimTime is the simulated wall-clock time for this round.
+	// Round 1 = SimStartTime, round N = SimStartTime + (N-1)*MinutesPerRound minutes.
+	SimTime time.Time
 }
 
 // ─── Platform Simulation ──────────────────────────────────────────────────────
@@ -124,6 +146,12 @@ func (ps *PlatformSim) Run(
 	if cfg.MaxRounds <= 0 {
 		cfg.MaxRounds = 10
 	}
+	if cfg.SimStartTime.IsZero() {
+		cfg.SimStartTime = time.Now()
+	}
+	if cfg.MinutesPerRound <= 0 {
+		cfg.MinutesPerRound = 60 // default: 1 hour per round
+	}
 
 	// ── Resolve mode ─────────────────────────────────────────────────────────
 	if cfg.Mode == "" {
@@ -138,6 +166,23 @@ func (ps *PlatformSim) Run(
 	feedWeights := platform.DefaultFeedWeights
 	if cfg.FeedWeights != nil {
 		feedWeights = *cfg.FeedWeights
+	}
+
+	// ── Open log file early (needed before personality building) ─────────────
+	logf := func(format string, args ...interface{}) {} // no-op when no OutputDir
+	var logFile *os.File
+	if cfg.OutputDir != "" {
+		if err2 := os.MkdirAll(cfg.OutputDir, 0755); err2 == nil {
+			logFile, _ = os.OpenFile(filepath.Join(cfg.OutputDir, "sim.log"),
+				os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+			if logFile != nil {
+				defer logFile.Close()
+				logf = func(format string, args ...interface{}) {
+					fmt.Fprintf(logFile, "[%s] "+format+"\n",
+						append([]interface{}{time.Now().Format("15:04:05.000")}, args...)...)
+				}
+			}
+		}
 	}
 
 	// ── Graph memory updater (optional) ──────────────────────────────────────
@@ -162,16 +207,25 @@ func (ps *PlatformSim) Run(
 	// Skip if pre-built personalities were supplied (via `sim prepare`).
 	var personalities []*platform.Personality
 	if len(cfg.Personalities) > 0 {
+		logf("PERSONALITIES pre-built n=%d", len(cfg.Personalities))
 		personalities = cfg.Personalities
 	} else if cfg.Mode == ModeNoLLM {
+		logf("PERSONALITIES building low-cost n=%d", len(nodes))
 		personalities = ps.buildPersonalitiesLow(nodes, cfg.SimConfig)
+		logf("PERSONALITIES done n=%d", len(personalities))
 	} else {
+		logf("PERSONALITIES building via LLM n=%d concurrency=%d", len(nodes), cfg.Concurrency)
+		t0 := time.Now()
 		personalities = ps.buildPersonalities(ctx, nodes, cfg.Scenario, cfg.Concurrency, cfg.SimConfig)
+		logf("PERSONALITIES done n=%d elapsed=%s", len(personalities), time.Since(t0).Round(time.Second))
 	}
 
 	// ── Build persona fingerprints for token compression (skip in NoLLM mode) ──
 	if cfg.Mode != ModeNoLLM {
+		logf("FINGERPRINTS building n=%d", len(personalities))
+		t0 := time.Now()
 		ps.buildFingerprints(ctx, personalities, cfg.Concurrency)
+		logf("FINGERPRINTS done elapsed=%s", time.Since(t0).Round(time.Second))
 	}
 
 	// ── Build InfluenceWeight and CommunityID lookup maps ────────────────────
@@ -204,7 +258,7 @@ func (ps *PlatformSim) Run(
 		})
 	}
 
-	// ── Open output file ──────────────────────────────────────────────────────
+	// ── Open actions.jsonl ────────────────────────────────────────────────────
 	var outFile *os.File
 	if cfg.OutputDir != "" {
 		if err := os.MkdirAll(cfg.OutputDir, 0755); err == nil {
@@ -215,9 +269,15 @@ func (ps *PlatformSim) Run(
 		}
 	}
 
+	logf("START scenario=%q mode=%s rounds=%d agents=%d platforms=%v",
+		cfg.Scenario, cfg.Mode, cfg.MaxRounds, len(personalities), cfg.Platforms)
+
 	// roundActions accumulates actions within a single round for graph memory.
 	var roundActions []platform.Action
 	var roundActionsMu sync.Mutex
+
+	// currentSimTime is updated at the start of each round and captured by emit.
+	var currentSimTime time.Time
 
 	emit := func(a platform.Action) {
 		if outFile != nil {
@@ -228,13 +288,20 @@ func (ps *PlatformSim) Run(
 			if !a.Success && a.Error != "" {
 				logs = []string{fmt.Sprintf("[%s/%s] %s: %s", a.Platform, a.AgentName, a.Type, a.Error)}
 			}
-			progressCh <- RoundProgress{
+			// Non-blocking send: heavy mode spawns many concurrent goroutines that
+			// all call emit(); a blocking send causes all semaphore slots to fill up
+			// and the simulation deadlocks. The file still captures every action.
+			select {
+			case progressCh <- RoundProgress{
 				Round:       a.Round,
 				MaxRounds:   cfg.MaxRounds,
 				Action:      a,
 				TwitterStat: twState.GetStats(),
 				RedditStat:  rdState.GetStats(),
 				Logs:        logs,
+				SimTime:     currentSimTime,
+			}:
+			default: // channel full — drop UI update, sim continues
 			}
 		}
 		if memUpdater != nil && a.AgentName != "" {
@@ -290,9 +357,14 @@ func (ps *PlatformSim) Run(
 	for round := 1; round <= cfg.MaxRounds; round++ {
 		select {
 		case <-ctx.Done():
+			logf("CANCELLED round=%d", round)
 			return ctx.Err()
 		default:
 		}
+		// Simulation clock: round 1 = SimStartTime, each subsequent round advances by MinutesPerRound.
+		simTime := cfg.SimStartTime.Add(time.Duration(round-1) * time.Duration(cfg.MinutesPerRound) * time.Minute)
+		currentSimTime = simTime
+		logf("ROUND_START round=%d/%d simTime=%s", round, cfg.MaxRounds, simTime.Format("2006-01-02 15:04 MST"))
 
 		// Reset per-round action collection for graph memory.
 		roundActionsMu.Lock()
@@ -393,16 +465,66 @@ func (ps *PlatformSim) Run(
 			// ════════════════════════════════════════════════════════════════
 			sem := make(chan struct{}, cfg.Concurrency)
 			var wg sync.WaitGroup
+			var agentsDone atomic.Int32
+			agentsTotal := int32(len(personalities))
+
+			// Heartbeat goroutine: emits a liveness ping every 2s so the TUI
+			// doesn't appear frozen while agents are waiting for LLM responses.
+			hbDone := make(chan struct{})
+			go func() {
+				ticker := time.NewTicker(2 * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						if progressCh != nil {
+							done := int(agentsDone.Load())
+							select {
+							case progressCh <- RoundProgress{
+								Round:       round,
+								MaxRounds:   cfg.MaxRounds,
+								TwitterStat: twState.GetStats(),
+								RedditStat:  rdState.GetStats(),
+								Heartbeat:   true,
+								AgentsDone:  done,
+								AgentsTotal: int(agentsTotal),
+								SimTime:     currentSimTime,
+							}:
+							default:
+							}
+						}
+					case <-hbDone:
+						return
+					}
+				}
+			}()
+
 			for _, p := range personalities {
 				wg.Add(1)
 				go func(pers *platform.Personality) {
 					defer wg.Done()
+					defer agentsDone.Add(1)
 					sem <- struct{}{}
 					defer func() { <-sem }()
 
 					runHeavyPlatform := func(state *platform.State, platName string) {
 						tl := platform.RankedFeed(state, pers, 10, influenceByID, feedWeights, round, communityByID)
-						results := ps.heavyDecide(ctx, pers, tl, cfg.Scenario, round, platName)
+						// Mark these posts as seen so they don't reappear in future rounds
+						seenIDs := make([]string, len(tl))
+						for i, post := range tl { seenIDs[i] = post.ID }
+						state.MarkSeen(pers.AgentID, seenIDs)
+						// Per-agent timeout: a stuck LLM call should not block the whole round.
+						agentCtx, agentCancel := context.WithTimeout(ctx, heavyAgentTimeout)
+						defer agentCancel()
+						t0 := time.Now()
+						logf("AGENT_START r=%d agent=%q plat=%s feed=%d", round, pers.Name, platName, len(tl))
+						results := ps.heavyDecide(agentCtx, pers, tl, cfg.Scenario, round, platName)
+						elapsed := time.Since(t0).Round(time.Millisecond)
+						if agentCtx.Err() != nil {
+							logf("AGENT_TIMEOUT r=%d agent=%q plat=%s after=%s", round, pers.Name, platName, elapsed)
+						} else {
+							logf("AGENT_DONE r=%d agent=%q plat=%s elapsed=%s actions=%d", round, pers.Name, platName, elapsed, len(results))
+						}
 						for _, res := range results {
 							planned := res.Action
 							content := res.Content
@@ -424,7 +546,7 @@ func (ps *PlatformSim) Run(
 									Content:    content,
 									ParentID:   planned.PostID,
 									Timestamp:  time.Now(),
-									Tags:       platform.ExtractTags(content),
+									Tags:       platform.PostTagsOrFallback(content, pers.Interests),
 								}
 								if platName == "reddit" {
 									post.Subreddit = pickSub(pers.Interests)
@@ -487,7 +609,10 @@ func (ps *PlatformSim) Run(
 					}
 				}(p)
 			}
+			logf("HEAVY_WAIT r=%d waiting for %d agents", round, len(personalities))
 			wg.Wait()
+			close(hbDone) // stop heartbeat goroutine
+			logf("ROUND_END r=%d mode=heavy events_tw=%d events_rd=%d", round, twState.GetStats().Posts, rdState.GetStats().Posts)
 		} else {
 			// ════════════════════════════════════════════════════════════════
 			// Batch / NoLLM mode
@@ -506,7 +631,11 @@ func (ps *PlatformSim) Run(
 
 					runBatchPlatform := func(state *platform.State, platName string) {
 						tl := platform.RankedFeed(state, pers, 10, influenceByID, feedWeights, round, communityByID)
-						for _, planned := range pers.DecideFromTimeline(tl, cfg.Scenario, round, platName) {
+						// Mark these posts as seen so they don't reappear in future rounds
+						seenIDs := make([]string, len(tl))
+						for i, post := range tl { seenIDs[i] = post.ID }
+						state.MarkSeen(pers.AgentID, seenIDs)
+						for _, planned := range pers.DecideAt(tl, cfg.Scenario, round, simTime, platName) {
 							if !planned.NeedLLM {
 								if a := execNoLLM(pers, planned, state, round); a != nil {
 									// Record interactions for likes/reposts
@@ -595,7 +724,7 @@ func (ps *PlatformSim) Run(
 						Content:    content,
 						ParentID:   it.planned.PostID,
 						Timestamp:  time.Now(),
-						Tags:       platform.ExtractTags(content),
+						Tags:       platform.PostTagsOrFallback(content, it.pers.Interests),
 					}
 					if it.state.Platform == "reddit" {
 						post.Subreddit = pickSub(it.pers.Interests)
@@ -645,6 +774,7 @@ func (ps *PlatformSim) Run(
 			Round:       cfg.MaxRounds,
 			TwitterStat: twState.GetStats(),
 			RedditStat:  rdState.GetStats(),
+			SimTime:     currentSimTime,
 		}
 	}
 	return nil

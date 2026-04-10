@@ -2,6 +2,7 @@ package platform
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"sync"
 
@@ -51,6 +52,7 @@ type AgentSimConfig struct {
 	Username     string
 	RealName     string
 	Profession   string
+	Location     string // free-text location from social-media bio
 	Creativity   float64
 	Rationality  float64
 	Empathy      float64
@@ -103,8 +105,10 @@ func defaultActivityByHour(timezone string) [24]float64 {
 
 // ─── GenerateSimConfig ────────────────────────────────────────────────────────
 
-// llmAgentResponse is the JSON shape expected from the LLM per-agent prompt.
+// llmAgentResponse is the JSON shape expected from the LLM per-agent batch prompt.
+// The "id" field matches the index sent in the request array.
 type llmAgentResponse struct {
+	ID              int      `json:"id"`
 	Stance          string   `json:"stance"`
 	SentimentBias   float64  `json:"sentiment_bias"`
 	PostsPerHour    float64  `json:"posts_per_hour"`
@@ -115,6 +119,7 @@ type llmAgentResponse struct {
 	Username     string   `json:"username"`
 	RealName     string   `json:"real_name"`
 	Profession   string   `json:"profession"`
+	Location     string   `json:"location"`  // e.g. "Tokyo, Japan" — used to infer timezone
 	Creativity   float64  `json:"creativity"`
 	Rationality  float64  `json:"rationality"`
 	Empathy      float64  `json:"empathy"`
@@ -170,9 +175,48 @@ func clampInfluenceWeight(v float64) float64 {
 	return v
 }
 
-// GenerateSimConfig generates per-agent simulation config using the LLM concurrently.
-// For each node, a compact prompt is sent: "name|type|scenario → stance, sentiment_bias, activity level".
-// Falls back to defaults if the LLM call fails for any individual agent.
+// agentBatchSize is the max number of agents per LLM call.
+// ~20 agents fits comfortably within a typical 4096-token context window.
+const agentBatchSize = 20
+
+const simConfigSysPrompt = `You are building rich social-media agent personas for a simulation.
+
+Given a JSON array of agents (id, name, type, bio), return a JSON array of persona configs in the SAME ORDER with the SAME length. Each element:
+{
+  "id": <same integer>,
+  "stance": "neutral",
+  "sentiment_bias": 0.0,
+  "posts_per_hour": 1.0,
+  "comments_per_hour": 2.0,
+  "influence_weight": 1.0,
+  "username": "handle_without_@",
+  "real_name": "Display Name",
+  "profession": "role or job",
+  "location": "City, Country",
+  "creativity": 0.5,
+  "rationality": 0.5,
+  "empathy": 0.5,
+  "extraversion": 0.5,
+  "openness": 0.5,
+  "posting_style": "informative",
+  "catchphrases": ["phrase1","phrase2","phrase3"],
+  "topics": ["topic1","topic2"]
+}
+Rules:
+- stance: supportive | opposing | neutral | observer (relative to the scenario)
+- sentiment_bias: -1.0 to 1.0
+- posts_per_hour: 0.1 to 5.0, comments_per_hour: 0.1 to 10.0
+- influence_weight: 0.0 to 2.0 (celebrities/orgs should be higher)
+- creativity/rationality/empathy/extraversion/openness: 0.0 to 1.0
+- posting_style: formal | casual | technical | emotional | analytical | informative | humorous
+- catchphrases: 3-5 phrases this agent characteristically uses
+- location: realistic city and country that fits the agent's background
+- Return ONLY the JSON array, no markdown.`
+
+// GenerateSimConfig generates per-agent simulation config using a single batched LLM
+// call per group of agents (≤20 per call). This replaces the old 1-call-per-agent
+// approach, reducing total LLM calls by ~20× and improving consistency since the
+// LLM sees all agents at once and can assign complementary roles.
 func GenerateSimConfig(
 	ctx context.Context,
 	llmClient *llm.Client,
@@ -180,10 +224,6 @@ func GenerateSimConfig(
 	scenario, timezone string,
 	concurrency int,
 ) (*SimConfig, error) {
-	if concurrency <= 0 {
-		concurrency = 6
-	}
-
 	cfg := &SimConfig{
 		Scenario:       scenario,
 		TimeZone:       timezone,
@@ -191,79 +231,47 @@ func GenerateSimConfig(
 		AgentCfgs:      make([]AgentSimConfig, len(nodes)),
 	}
 
+	// Fill all slots with defaults first so any failed batch still has safe values.
+	for i, n := range nodes {
+		cfg.AgentCfgs[i] = agentSimConfigDefaults(n.ID)
+	}
+
+	// Split nodes into batches of agentBatchSize and run them concurrently.
+	type batchJob struct {
+		startIdx int
+		nodes    []db.Node
+	}
+	var jobs []batchJob
+	for i := 0; i < len(nodes); i += agentBatchSize {
+		end := i + agentBatchSize
+		if end > len(nodes) {
+			end = len(nodes)
+		}
+		jobs = append(jobs, batchJob{startIdx: i, nodes: nodes[i:end]})
+	}
+
+	if concurrency <= 0 {
+		concurrency = 4
+	}
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
+	var mu sync.Mutex
 
-	const sysPrompt = `Given "name|type|scenario", infer a rich agent persona and activity config for a social simulation.
-Return JSON only (no markdown):
-{
-  "stance":"neutral",
-  "sentiment_bias":0.0,
-  "posts_per_hour":1.0,
-  "comments_per_hour":2.0,
-  "influence_weight":1.0,
-  "username":"handle_123",
-  "real_name":"Display Name",
-  "profession":"role description",
-  "creativity":0.5,
-  "rationality":0.5,
-  "empathy":0.5,
-  "extraversion":0.5,
-  "openness":0.5,
-  "posting_style":"informative",
-  "catchphrases":["phrase one","phrase two","phrase three"],
-  "topics":["topic1","topic2"]
-}
-stance: one of supportive, opposing, neutral, observer
-sentiment_bias: -1.0 (very negative) to 1.0 (very positive)
-posts_per_hour: 0.1 to 5.0
-comments_per_hour: 0.1 to 10.0
-influence_weight: 0.0 to 2.0
-creativity/rationality/empathy/extraversion/openness: 0.0 to 1.0
-posting_style: one of formal, casual, technical, emotional, analytical, informative, humorous
-catchphrases: 3-5 characteristic phrases this agent uses
-topics: list of content topics this agent favors`
-
-	for i, node := range nodes {
+	for _, job := range jobs {
 		wg.Add(1)
-		go func(idx int, n db.Node) {
+		go func(j batchJob) {
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
 
-			def := agentSimConfigDefaults(n.ID)
+			results := generateAgentBatch(ctx, llmClient, j.nodes, scenario)
 
-			prompt := fmt.Sprintf("%s|%s|scenario: %s", n.Name, n.Type, truncateScenario(scenario))
-			var resp llmAgentResponse
-			err := llmClient.JSON(ctx, sysPrompt, prompt, &resp)
-			if err != nil {
-				cfg.AgentCfgs[idx] = def
-				return
+			mu.Lock()
+			for localIdx, ac := range results {
+				cfg.AgentCfgs[j.startIdx+localIdx] = ac
 			}
-
-			cfg.AgentCfgs[idx] = AgentSimConfig{
-				AgentID:         n.ID,
-				Stance:          validateStance(resp.Stance),
-				SentimentBias:   clampSentimentBias(resp.SentimentBias),
-				PostsPerHour:    clampPositive(resp.PostsPerHour, def.PostsPerHour),
-				CommentsPerHour: clampPositive(resp.CommentsPerHour, def.CommentsPerHour),
-				ActiveHours:     def.ActiveHours, // LLM doesn't return this; keep default
-				InfluenceWeight: clampInfluenceWeight(resp.InfluenceWeight),
-
-				// Rich persona fields
-				Username:     resp.Username,
-				RealName:     resp.RealName,
-				Profession:   resp.Profession,
-				Creativity:   clampUnit(resp.Creativity),
-				Rationality:  clampUnit(resp.Rationality),
-				Empathy:      clampUnit(resp.Empathy),
-				Extraversion: clampUnit(resp.Extraversion),
-				Openness:     clampUnit(resp.Openness),
-				PostingStyle: validatePostingStyle(resp.PostingStyle),
-				Catchphrases: resp.Catchphrases,
-				Topics:       resp.Topics,
-			}
-		}(i, node)
+			mu.Unlock()
+		}(job)
 	}
 	wg.Wait()
 
@@ -271,6 +279,92 @@ topics: list of content topics this agent favors`
 	cfg.EventConfig = generateEventConfig(ctx, llmClient, scenario, cfg.AgentCfgs)
 
 	return cfg, nil
+}
+
+// generateAgentBatch sends one LLM call for a slice of nodes (≤agentBatchSize)
+// and returns AgentSimConfig for each, in the same order.
+// Falls back to defaults for any agent the LLM omits or garbles.
+func generateAgentBatch(
+	ctx context.Context,
+	llmClient *llm.Client,
+	nodes []db.Node,
+	scenario string,
+) []AgentSimConfig {
+	type reqItem struct {
+		ID   int    `json:"id"`
+		Name string `json:"name"`
+		Type string `json:"type"`
+		Bio  string `json:"bio,omitempty"`
+	}
+
+	// Build request array
+	reqs := make([]reqItem, len(nodes))
+	for i, n := range nodes {
+		bio := n.Summary
+		if len([]rune(bio)) > 120 {
+			bio = string([]rune(bio)[:120]) + "…"
+		}
+		reqs[i] = reqItem{ID: i, Name: n.Name, Type: n.Type, Bio: bio}
+	}
+
+	reqJSON, err := json.Marshal(reqs)
+	if err != nil {
+		return defaultsForNodes(nodes)
+	}
+
+	userPrompt := fmt.Sprintf("Scenario: %s\n\nAgents:\n%s", truncateScenario(scenario), string(reqJSON))
+
+	var responses []llmAgentResponse
+	if err := llmClient.JSON(ctx, simConfigSysPrompt, userPrompt, &responses); err != nil || len(responses) == 0 {
+		return defaultsForNodes(nodes)
+	}
+
+	// Index responses by their "id" field for robust matching (LLM may reorder).
+	byID := make(map[int]llmAgentResponse, len(responses))
+	for _, r := range responses {
+		byID[r.ID] = r
+	}
+
+	results := make([]AgentSimConfig, len(nodes))
+	for i, n := range nodes {
+		def := agentSimConfigDefaults(n.ID)
+		resp, ok := byID[i]
+		if !ok {
+			results[i] = def
+			continue
+		}
+		results[i] = AgentSimConfig{
+			AgentID:         n.ID,
+			Stance:          validateStance(resp.Stance),
+			SentimentBias:   clampSentimentBias(resp.SentimentBias),
+			PostsPerHour:    clampPositive(resp.PostsPerHour, def.PostsPerHour),
+			CommentsPerHour: clampPositive(resp.CommentsPerHour, def.CommentsPerHour),
+			ActiveHours:     def.ActiveHours,
+			InfluenceWeight: clampInfluenceWeight(resp.InfluenceWeight),
+			Username:        resp.Username,
+			RealName:        resp.RealName,
+			Profession:      resp.Profession,
+			Location:        resp.Location,
+			Creativity:      clampUnit(resp.Creativity),
+			Rationality:     clampUnit(resp.Rationality),
+			Empathy:         clampUnit(resp.Empathy),
+			Extraversion:    clampUnit(resp.Extraversion),
+			Openness:        clampUnit(resp.Openness),
+			PostingStyle:    validatePostingStyle(resp.PostingStyle),
+			Catchphrases:    resp.Catchphrases,
+			Topics:          resp.Topics,
+		}
+	}
+	return results
+}
+
+// defaultsForNodes returns default AgentSimConfig for a slice of nodes.
+func defaultsForNodes(nodes []db.Node) []AgentSimConfig {
+	out := make([]AgentSimConfig, len(nodes))
+	for i, n := range nodes {
+		out[i] = agentSimConfigDefaults(n.ID)
+	}
+	return out
 }
 
 // llmEventConfigResponse is the JSON shape expected from the LLM event-config prompt.
@@ -464,5 +558,72 @@ func ApplySimConfig(personalities []*Personality, cfg *SimConfig) {
 		if len(ac.Topics) > 0 {
 			p.Interests = ac.Topics
 		}
+		if ac.Location != "" {
+			p.Location = ac.Location
+		}
+		// Infer timezone from location (no LLM — local lookup table)
+		if p.Location != "" && (p.Timezone == "" || p.Timezone == "UTC") {
+			p.Timezone = InferTimezone(p.Location)
+		}
+	}
+}
+
+// PersistPersonalityAttrs writes sim-generated personality values back to node.Attributes
+// in the database so the TUI and web views can display real values instead of defaults.
+// All numeric fields are stored as float64; arrays as JSON arrays — no stringified values.
+func PersistPersonalityAttrs(database *db.DB, personalities []*Personality) {
+	for _, p := range personalities {
+		if p == nil {
+			continue
+		}
+		// Read existing attrs to preserve extraction metadata (e.g. "extracted": true).
+		node, err := database.GetNode(p.AgentID)
+		if err != nil {
+			continue
+		}
+		attrs := make(map[string]interface{})
+		if node.Attributes != "" && node.Attributes != "{}" {
+			_ = json.Unmarshal([]byte(node.Attributes), &attrs)
+		}
+
+		// Personality fields — stored with clean types for easy JSON parsing.
+		attrs["has_personality"]  = true
+		attrs["stance"]           = p.Stance
+		attrs["activity_level"]   = p.ActivityLevel
+		attrs["sentiment_bias"]   = p.SentimentBias
+		attrs["influence_weight"] = p.InfluenceWeight
+		attrs["originality"]      = p.Originality
+		attrs["reactivity"]       = p.Reactivity
+		attrs["creativity"]       = p.Creativity
+		attrs["rationality"]      = p.Rationality
+		attrs["empathy"]          = p.Empathy
+		attrs["extraversion"]     = p.Extraversion
+		attrs["openness"]         = p.Openness
+		attrs["posts_per_hour"]   = p.PostsPerHour
+		attrs["comments_per_hour"] = p.CommentsPerHour
+		if p.Profession != "" {
+			attrs["profession"] = p.Profession
+		}
+		if p.Username != "" {
+			attrs["username"] = p.Username
+		}
+		if len(p.Interests) > 0 {
+			attrs["interests"] = p.Interests // []string → JSON array
+		}
+		if len(p.Catchphrases) > 0 {
+			attrs["catchphrases"] = p.Catchphrases // []string → JSON array
+		}
+		if p.Location != "" {
+			attrs["location"] = p.Location
+		}
+		if p.Timezone != "" {
+			attrs["timezone"] = p.Timezone
+		}
+
+		raw, err := json.Marshal(attrs)
+		if err != nil {
+			continue
+		}
+		_ = database.UpdateNodeAttributes(p.AgentID, string(raw))
 	}
 }

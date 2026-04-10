@@ -303,6 +303,61 @@ func (db *DB) UpdateCommunity(nodeID string, communityID int) error {
 	return err
 }
 
+func (db *DB) GetNode(nodeID string) (Node, error) {
+	var n Node
+	err := db.QueryRow(`
+		SELECT id, project_id, name, type, COALESCE(summary,''), COALESCE(attributes,'{}'),
+		       community_id, COALESCE(pagerank, 0.0)
+		FROM nodes WHERE id = ?`, nodeID).
+		Scan(&n.ID, &n.ProjectID, &n.Name, &n.Type, &n.Summary, &n.Attributes, &n.CommunityID, &n.PageRank)
+	return n, err
+}
+
+func (db *DB) UpdateNodeAttributes(nodeID, attributes string) error {
+	_, err := db.Exec(`UPDATE nodes SET attributes = ? WHERE id = ?`, attributes, nodeID)
+	return err
+}
+
+// UpdateNode updates the name, type, summary, and attributes of a node.
+func (db *DB) UpdateNode(nodeID, name, nodeType, summary, attrs string) error {
+	_, err := db.Exec(
+		`UPDATE nodes SET name = ?, type = ?, summary = ?, attributes = ? WHERE id = ?`,
+		name, nodeType, summary, attrs, nodeID)
+	return err
+}
+
+// InsertNode creates a new node with a fresh UUID and returns its ID.
+func (db *DB) InsertNode(projectID, name, nodeType, summary, attrs string) (string, error) {
+	id := uuid.New().String()
+	_, err := db.Exec(
+		`INSERT INTO nodes (id, project_id, name, type, summary, attributes) VALUES (?, ?, ?, ?, ?, ?)`,
+		id, projectID, name, nodeType, summary, attrs)
+	return id, err
+}
+
+// MergeNodes rewires all edges from dropID to keepID then deletes dropID.
+// Self-loops created by the rewiring are removed automatically.
+func (db *DB) MergeNodes(keepID, dropID string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.Exec(`UPDATE edges SET source_id = ? WHERE source_id = ?`, keepID, dropID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE edges SET target_id = ? WHERE target_id = ?`, keepID, dropID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM edges WHERE source_id = ? AND target_id = ?`, keepID, keepID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM nodes WHERE id = ?`, dropID); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ─── Edges ──────────────────────────────────────────────────────────────────
 
 type Edge struct {

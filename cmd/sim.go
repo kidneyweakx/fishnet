@@ -852,6 +852,9 @@ can skip this expensive step and start running immediately.`,
 		ctx := context.Background()
 		personalities := ps.BuildPersonalities(ctx, nodes, sess.Scenario, concurrency, nil)
 
+		// Write personality values back to node attributes so TUI/web can display them.
+		platform.PersistPersonalityAttrs(database, personalities)
+
 		// Persist personas
 		store := sim.NewPersonaStore(".")
 		pp := &sim.PreparedPersonalities{

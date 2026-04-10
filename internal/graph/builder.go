@@ -116,6 +116,17 @@ func (b *Builder) BuildFromChunks(
 		batches = append(batches, batch{chunks: chunks[i:end]})
 	}
 
+	// For ONNX mode: create one shared engine before spawning goroutines.
+	// Each NewOnnxExtractor() loads the model (~seconds); sharing avoids N×overhead.
+	var sharedOnnx *OnnxExtractor
+	if b.config.ExtractionMode == "onnx" {
+		if ex, err := NewOnnxExtractor(); err == nil {
+			sharedOnnx = ex
+			defer sharedOnnx.Close()
+		}
+		// If model not ready, sharedOnnx stays nil → goroutines fall back to local NER.
+	}
+
 	sem := make(chan struct{}, concurrency)
 	var wg sync.WaitGroup
 	var mu sync.Mutex
@@ -150,16 +161,14 @@ func (b *Builder) BuildFromChunks(
 					return
 				}
 			} else if b.config.ExtractionMode == "onnx" {
-				// ONNX multilingual BERT NER — no LLM needed, 100x faster.
-				// Supports Chinese + English natively without translation.
-				onnxEx, onnxErr := NewOnnxExtractor()
-				if onnxErr != nil {
-					// Fallback to local NER if ONNX not available (model not downloaded).
+				// ONNX multilingual BERT NER — no LLM needed, ~100× faster than cloud LLM.
+				// sharedOnnx is thread-safe (internal mutex); created once above.
+				if sharedOnnx != nil {
+					extracted = sharedOnnx.Extract(texts)
+				} else {
+					// Model not downloaded — fall back to local prose NER.
 					localEx := NewLocalExtractor()
 					extracted = localEx.Extract(translateCJKBatch(ctx, b.llm, texts))
-				} else {
-					defer onnxEx.Close()
-					extracted = onnxEx.Extract(texts)
 				}
 			} else {
 				// "local" / "hybrid" / "" — prose NER.

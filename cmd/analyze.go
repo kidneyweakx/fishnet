@@ -15,6 +15,7 @@ import (
 	"fishnet/internal/doc"
 	"fishnet/internal/graph"
 	"fishnet/internal/llm"
+	"fishnet/internal/nlp"
 	"fishnet/internal/task"
 )
 
@@ -22,10 +23,13 @@ var analyzeCmd = &cobra.Command{
 	Use:   "analyze",
 	Short: "Read documents and build knowledge graph",
 	Long: `Read all .txt/.md/.rst/.csv/.json files from the source directory,
-chunk them, extract entities via LLM, and store in the local graph.`,
+chunk them, extract entities, and store in the local graph.
+
+By default uses local ONNX NER (no API key needed, Chinese+English, fast).
+Use --llm to switch to cloud LLM extraction.`,
 	Example: `  fishnet analyze
-  fishnet analyze --dir ./docs --concurrency 8
-  fishnet analyze --dir ./reports --chunk-size 800
+  fishnet analyze --dir ./docs
+  fishnet analyze --llm --dir ./reports
   fishnet analyze --resume task-20240409-143022`,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		dir, _ := cmd.Flags().GetString("dir")
@@ -36,6 +40,8 @@ chunk them, extract entities via LLM, and store in the local graph.`,
 		community, _ := cmd.Flags().GetBool("community")
 		useOntology, _ := cmd.Flags().GetBool("ontology")
 		resumeTaskID, _ := cmd.Flags().GetString("resume")
+		useLLM, _ := cmd.Flags().GetBool("llm")
+		useOnnx := !useLLM // ONNX is the default; LLM is opt-in
 
 		if cfg.LLM.APIKey == "" {
 			if k := os.Getenv("FISHNET_API_KEY"); k != "" {
@@ -83,7 +89,7 @@ chunk them, extract entities via LLM, and store in the local graph.`,
 			absDir = t.Dir
 			useOntology = t.HasOntology
 			community = t.HasCommunity
-			return runExtraction(database, projectID, absDir, concurrency, useOntology, community, t, taskMgr)
+			return runExtraction(database, projectID, absDir, concurrency, useOntology, community, useOnnx, t, taskMgr)
 		}
 
 		// ── Step 1: Read documents ───────────────────────────────────────────────
@@ -133,7 +139,7 @@ chunk them, extract entities via LLM, and store in the local graph.`,
 			fmt.Printf("%s Task created: %s\n", cyan("→"), bold(t.ID))
 		}
 
-		return runExtraction(database, projectID, absDir, concurrency, useOntology, community, t, taskMgr)
+		return runExtraction(database, projectID, absDir, concurrency, useOntology, community, useOnnx, t, taskMgr)
 	},
 }
 
@@ -143,7 +149,7 @@ func runExtraction(
 	database *db.DB,
 	projectID, absDir string,
 	concurrency int,
-	useOntology, community bool,
+	useOntology, community, useOnnx bool,
 	t *task.GraphTask,
 	taskMgr *task.Manager,
 ) error {
@@ -173,19 +179,41 @@ func runExtraction(
 			_ = taskMgr.Save(t)
 		}
 	} else {
-		if cfg.LLM.APIKey == "" && cfg.LLM.Provider != "ollama" {
-			return fmt.Errorf("no API key set; run: fishnet config set api-key <key>")
+		// Download ONNX model on first use (one-time, ~86 MB).
+		if useOnnx {
+			modelReady, _ := nlp.IsModelReady()
+			if !modelReady {
+				fmt.Printf("\n%s First run: downloading ONNX NER model (~86 MB, one-time)...\n", cyan("→"))
+				if err := nlp.EnsureModels(true); err != nil {
+					if cfg.LLM.APIKey != "" || cfg.LLM.Provider == "ollama" {
+						fmt.Printf("%s Model download failed, falling back to LLM extraction.\n", yellow("!"))
+						useOnnx = false
+					} else {
+						return fmt.Errorf("model download failed: %w", err)
+					}
+				} else {
+					fmt.Printf("%s Model ready.\n", green("✓"))
+				}
+			}
 		}
 
-		client := llm.New(cfg.LLM)
+		// LLM client — only needed for LLM extraction or ontology; nil is fine for ONNX.
+		var client *llm.Client
+		if !useOnnx || useOntology {
+			client = llm.New(cfg.LLM)
+		}
 		if concurrency <= 0 {
 			concurrency = cfg.LLM.MaxConcurrency
 		}
 
 		ctx := context.Background()
 
-		// ── Step 3a: Generate ontology (optional) ──────────────────────────────
+		// ── Step 3a: Generate ontology (optional, LLM only) ────────────────────
 		var builderCfg graph.Config
+		if useOnnx {
+			builderCfg.ExtractionMode = "onnx"
+			useOntology = false // ontology generation requires LLM
+		}
 		if useOntology {
 			docs, _ := doc.ReadDir(absDir)
 			if len(docs) > 0 {
@@ -324,5 +352,6 @@ func init() {
 	analyzeCmd.Flags().Bool("community", false, "Run community detection after extraction")
 	analyzeCmd.Flags().Bool("ontology", true, "Generate domain ontology before extraction (default: true)")
 	analyzeCmd.Flags().String("resume", "", "Resume an interrupted build task by task ID")
+	analyzeCmd.Flags().Bool("llm", false, "Use cloud LLM for extraction instead of local ONNX (requires API key)")
 	rootCmd.AddCommand(analyzeCmd)
 }
